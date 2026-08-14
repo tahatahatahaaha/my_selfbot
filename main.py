@@ -17,7 +17,6 @@ import asyncio
 
 import antidelete
 import clock
-import command_loop
 import event_layer
 import plugins  # noqa: F401 -- importing this registers every plugin
 from logger import log
@@ -43,7 +42,6 @@ async def main():
         log.error(f"Failed to start Control Bot: {e}")
 
     await clock.on_selfbot_start(client)
-    asyncio.create_task(command_loop.run())
 
     try:
         await client.run_until_disconnected()

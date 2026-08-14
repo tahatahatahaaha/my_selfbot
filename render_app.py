@@ -46,13 +46,13 @@ def spawn(script):
 
 
 def supervise():
-    log.info("Starting SelfBot...")
+    # main.py already starts the Control Bot in-process (see
+    # start_control_bot() inside main.py) — spawning control_bot.py as its
+    # own subprocess here used to just sit there doing nothing (it has no
+    # __main__ block), wasting an entire idle Python interpreter's worth of
+    # RAM for no reason. One process is all that's needed.
+    log.info("Starting SelfBot (includes Control Bot)...")
     selfbot = spawn("main.py")
-
-    time.sleep(3)
-
-    log.info("Starting Control Bot...")
-    control_bot = spawn("control_bot.py")
 
     log.ok("Everything started")
 
@@ -62,10 +62,6 @@ def supervise():
         if selfbot.poll() is not None:
             log.error("SelfBot stopped! Restarting...")
             selfbot = spawn("main.py")
-
-        if control_bot.poll() is not None:
-            log.error("Control Bot stopped! Restarting...")
-            control_bot = spawn("control_bot.py")
 
 
 if __name__ == "__main__":

@@ -14,13 +14,11 @@ def spawn(script):
 
 
 def main():
-    log.info("Starting SelfBot...")
+    # main.py starts the Control Bot itself, in-process — no need to spawn
+    # control_bot.py separately (it has no __main__ block anyway, so doing
+    # so used to just burn RAM on an idle interpreter for nothing).
+    log.info("Starting SelfBot (includes Control Bot)...")
     selfbot = spawn("main.py")
-
-    time.sleep(3)
-
-    log.info("Starting Control Bot...")
-    control_bot = spawn("control_bot.py")
 
     log.ok("Everything started")
 
@@ -32,14 +30,9 @@ def main():
                 log.error("SelfBot stopped! Restarting...")
                 selfbot = spawn("main.py")
 
-            if control_bot.poll() is not None:
-                log.error("Control Bot stopped! Restarting...")
-                control_bot = spawn("control_bot.py")
-
     except KeyboardInterrupt:
         log.info("Stopping...")
         selfbot.terminate()
-        control_bot.terminate()
 
 
 if __name__ == "__main__":

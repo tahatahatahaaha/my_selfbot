@@ -35,8 +35,6 @@ CLOCK_INTERVAL_SECONDS = _get("CLOCK_INTERVAL_SECONDS", default=60, cast=int)
 # Timezone used for the clock in the display name
 CLOCK_TIMEZONE = _get("CLOCK_TIMEZONE", default="Asia/Tehran")
 
-COMMAND_FILE = "command.txt"
-
 # .ai command — powered by OpenRouter, chosen so the model/key/base URL
 # are all just config, never code. Free tier: https://openrouter.ai/keys.
 # Leave OPENROUTER_API_KEY blank to disable .ai.

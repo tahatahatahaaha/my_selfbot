@@ -58,6 +58,7 @@ FONTS = {
         "e": "\u212F", "g": "\u210A", "o": "\u2134",
     })),
     "small_caps": ("Sᴍᴀʟʟ Cᴀᴘs", dict(_small_caps_map)),
+    "bold_script": ("𝓑𝓸𝓵𝓭 𝓢𝓬𝓻𝓲𝓹𝓽", _range_map(0x1D4D0, 0x1D4EA, None)),
 }
 
 _state = {"active": None}

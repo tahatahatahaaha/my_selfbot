@@ -1,9 +1,11 @@
 """
 Command Router — plain exact-command/alias dispatch. No AI, no agent, no
 natural-language fallback: if the first word after the prefix isn't one of
-the commands below, the message is silently ignored (same as a `.` typo in
-normal chat always did).
+the commands below (or close enough to one — see _resolve_cmd), the
+message is silently ignored (same as a `.` typo in normal chat always did).
 """
+
+import difflib
 
 from telethon.errors import FloodWaitError
 
@@ -11,8 +13,35 @@ from help_text import HELP_TEXT
 from logger import log
 from plugins import ai_chat, core, media, moderation, panel, social, translate
 
+# Every command word this bot recognizes, canonical spelling. Used as the
+# fuzzy-match target list below — NOT the dispatch logic itself, which
+# still lives in the plain elif chain further down.
+_KNOWN_COMMANDS = [
+    "ping", "status", "clock", "font", "quote", "اسکرین", "حذف", "تگ",
+    "پنل", "بستن", "بلاک", "block", "آنبلاک", "unblock", "تاریخ",
+    "help", "راهنما", "ai", "ایدی", "id", "ترجمه", "translate",
+]
+
+
+def _resolve_cmd(cmd: str) -> str:
+    """message_parser already normalizes Arabic/Persian character variants
+    (آ/أ/إ -> ا, ي -> ی, ك -> ک, ...), so spelling differences like
+    'آیدی' vs 'ایدی' already collapse to the same string by the time `cmd`
+    gets here. This adds one more layer of tolerance on top, for near-miss
+    typos (an extra/missing/swapped letter) — plain string similarity via
+    the stdlib, no AI/network call involved. Exact matches skip this
+    entirely; very short commands (id/ai) are excluded from fuzzy matching
+    since a 2-letter string can "look close" to almost anything."""
+    if cmd in _KNOWN_COMMANDS:
+        return cmd
+    if len(cmd) < 3:
+        return cmd
+    matches = difflib.get_close_matches(cmd, _KNOWN_COMMANDS, n=1, cutoff=0.8)
+    return matches[0] if matches else cmd
+
 
 async def route(event, cmd: str, arg: str, body: str):
+    cmd = _resolve_cmd(cmd)
     try:
         if cmd == "ping":
             await core.cmd_ping(event)

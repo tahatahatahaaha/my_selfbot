@@ -4,15 +4,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from config import BOT_TOKEN, COMMAND_FILE
-from fontstyle import FONTS
+import clock
+import fontstyle
+from config import BOT_TOKEN
 from help_text import HELP_TEXT
 from logger import log
+from telegram_layer import client as tg_client
 
-
-def send_command(command: str):
-    with open(COMMAND_FILE, "w", encoding="utf-8") as f:
-        f.write(command)
+FONTS = fontstyle.FONTS
 
 
 def main_menu_markup():
@@ -66,13 +65,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clock_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    send_command("clock_on")
-    await update.message.reply_text("⏰ Clock ON ارسال شد ✅")
+    await clock.start_clock(tg_client)
+    await update.message.reply_text("⏰ Clock ON ✅")
 
 
 async def clock_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    send_command("clock_off")
-    await update.message.reply_text("⏰ Clock OFF ارسال شد ✅")
+    await clock.stop_clock(tg_client)
+    await update.message.reply_text("⏰ Clock OFF ✅")
 
 
 async def font_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -123,24 +122,24 @@ async def _handle_callback(query, data):
         return
 
     if data == "clock_on":
-        send_command("clock_on")
-        await query.edit_message_text("⏰ Clock ON ارسال شد ✅", reply_markup=main_menu_markup())
+        await clock.start_clock(tg_client)
+        await query.edit_message_text("⏰ Clock ON ✅", reply_markup=main_menu_markup())
         return
 
     if data == "clock_off":
-        send_command("clock_off")
-        await query.edit_message_text("⏰ Clock OFF ارسال شد ✅", reply_markup=main_menu_markup())
+        await clock.stop_clock(tg_client)
+        await query.edit_message_text("⏰ Clock OFF ✅", reply_markup=main_menu_markup())
         return
 
     if data == "font:off":
-        send_command("font:off")
+        fontstyle.set_font(None)
         await query.edit_message_text("🔤 استایل فونت خاموش شد ✅", reply_markup=main_menu_markup())
         return
 
     if data.startswith("font:"):
         key = data.split(":", 1)[1]
         if key in FONTS:
-            send_command(f"font:{key}")
+            fontstyle.set_font(key)
             label = FONTS[key][0]
             await query.edit_message_text(f"🔤 فونت روی {label} تنظیم شد ✅", reply_markup=main_menu_markup())
         else:

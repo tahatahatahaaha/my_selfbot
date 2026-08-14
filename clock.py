@@ -128,6 +128,18 @@ async def on_selfbot_stop(client):
     log.ok("Clock turned OFF (auto, selfbot shutdown), last name cleared")
 
 
+def _seconds_to_next_minute(tz: str) -> float:
+    """How long until the wall clock in `tz` rolls over to :00 seconds.
+    Previously the loop just slept a flat CLOCK_INTERVAL_SECONDS (60s) from
+    whenever it happened to start — since that start moment is essentially
+    random relative to the wall clock, the name update could lag anywhere
+    from ~0 up to ~59 seconds behind the real minute change. Sleeping to
+    the exact next minute boundary instead means the update fires within a
+    second of the real time changing, every time."""
+    now = datetime.now(ZoneInfo(tz))
+    return 60 - now.second - now.microsecond / 1_000_000
+
+
 async def _clock_loop(client, initial_last_time=None):
     global clock_active
 
@@ -135,7 +147,7 @@ async def _clock_loop(client, initial_last_time=None):
     try:
         while clock_active:
             try:
-                now = datetime.now(ZoneInfo(CLOCK_TIMEZONE)).strftime("%H:%M")
+                sleep_for = _seconds_to_next_minute(CLOCK_TIMEZONE)
             except Exception as e:
                 # Common cause on Windows: the IANA timezone database isn't
                 # bundled with Python there, so ZoneInfo needs the separate
@@ -149,14 +161,23 @@ async def _clock_loop(client, initial_last_time=None):
                 await asyncio.sleep(CLOCK_INTERVAL_SECONDS)
                 continue
 
+            # Small buffer so we wake up a beat *after* the boundary rather
+            # than right on/just before it (clock drift could otherwise
+            # make us read the still-old minute).
+            await asyncio.sleep(max(sleep_for, 0) + 0.15)
+            if not clock_active:
+                break
+
+            now = datetime.now(ZoneInfo(CLOCK_TIMEZONE)).strftime("%H:%M")
             if now != last_time:
                 updated = await _set_last_name(client, now)
                 if updated:
                     last_time = now
-                # If the update failed (rate limited), we deliberately don't
-                # mark last_time as done, so the next tick retries with the
-                # same target time instead of silently giving up forever.
-            await asyncio.sleep(CLOCK_INTERVAL_SECONDS)
+                else:
+                    # Rate limited — don't busy-loop retrying every second;
+                    # back off to the old fixed interval until it succeeds,
+                    # then resume normal minute-aligned ticking.
+                    await asyncio.sleep(CLOCK_INTERVAL_SECONDS)
     except asyncio.CancelledError:
         pass
 
