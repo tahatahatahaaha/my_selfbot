@@ -111,7 +111,7 @@ async def _handle_callback(query, data):
     if data == "status":
         await query.edit_message_text("🟢 Control Bot فعال است", reply_markup=main_menu_markup())
         return
-[23/05/1405 11:49 ب.ظ] TMK 23:36: if data == "ping":
+    if data == "ping":
         start = time.monotonic()
         await query.edit_message_text("🏓 …")
         latency_ms = (time.monotonic() - start) * 1000
