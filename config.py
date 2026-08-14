@@ -28,9 +28,10 @@ PREFIX = _get("PREFIX", default=".")
 # Control bot (python-telegram-bot) token
 BOT_TOKEN = _get("BOT_TOKEN", required=True)
 
-# Optional local SOCKS5 proxy (e.g. V2RayN). Leave PROXY_HOST empty to disable.
-PROXY_HOST = _get("PROXY_HOST", default="")
-PROXY_PORT = _get("PROXY_PORT", default=0, cast=int)
+# MTProxy Configuration (Hardcoded with your proxy details)
+MTPROTO_SERVER = "opeenhostings.co.uk."
+MTPROTO_PORT = 443
+MTPROTO_SECRET = "eef0eeb0bd9adc4fd4a93994ee3b2a216b63646e2e79656b74616e65742e636f6d"
 
 # Clock update interval in seconds. Telegram rate-limits how often a profile
 # name can change, so don't set this too low (60s is a safe default).
@@ -41,9 +42,9 @@ CLOCK_TIMEZONE = _get("CLOCK_TIMEZONE", default="Asia/Tehran")
 
 COMMAND_FILE = "command.txt"
 
-# `.ai` command — powered by OpenRouter, chosen so the model/key/base URL
+# .ai command — powered by OpenRouter, chosen so the model/key/base URL
 # are all just config, never code. Free tier: https://openrouter.ai/keys.
-# Leave OPENROUTER_API_KEY blank to disable `.ai`.
+# Leave OPENROUTER_API_KEY blank to disable .ai.
 OPENROUTER_API_KEY = _get("OPENROUTER_API_KEY", default="")
 OPENROUTER_MODEL = _get("OPENROUTER_MODEL", default="qwen/qwen3-4b:free")
 OPENROUTER_BASE_URL = _get("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
@@ -62,8 +63,5 @@ PORT = _get("PORT", default=8080, cast=int)
 
 
 def get_proxy():
-    """Returns a Telethon-compatible proxy tuple, or None if disabled."""
-    if PROXY_HOST:
-        return ("socks5", PROXY_HOST, PROXY_PORT)
-    return None
-
+    """Returns a Telethon-compatible MTProto proxy tuple."""
+    return ("mtproto", MTPROTO_SERVER, MTPROTO_PORT, MTPROTO_SECRET)
