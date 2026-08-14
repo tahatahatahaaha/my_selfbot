@@ -1,4 +1,4 @@
-[23/05/1405 11:49 ب.ظ] TMK 23:36: import time
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
