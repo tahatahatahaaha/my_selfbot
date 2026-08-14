@@ -9,8 +9,7 @@ from logger import log
 from telegram_layer import client
 
 # وارد کردن تابع استارت ربات کنترل (اگر اسم فایلت چیزی غیر از bot است تغییرش بده)
-from bot import start_control_bot
-
+from bot import control_bot.py
 antidelete.register(client)
 event_layer.register_handlers()
 
