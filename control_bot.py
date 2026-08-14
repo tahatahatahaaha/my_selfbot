@@ -1,11 +1,10 @@
-import time
+[23/05/1405 11:36 ب.ظ] TMK 23:34: import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
-from telegram.request import HTTPXRequest
 
-from config import BOT_TOKEN, COMMAND_FILE, PROXY_HOST, PROXY_PORT
+from config import BOT_TOKEN, COMMAND_FILE
 from fontstyle import FONTS
 from help_text import HELP_TEXT
 from logger import log
@@ -33,8 +32,6 @@ def main_menu_markup():
 
 
 def font_menu_markup():
-    """Each button's label is the font's own name rendered in that font
-    (FONTS[key][0] is pre-styled), so tapping is a visual preview + pick."""
     keys = list(FONTS.keys())
     rows = []
     for i in range(0, len(keys), 2):
@@ -50,9 +47,9 @@ def font_menu_markup():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 **پنل کنترل سلف**\n\n"
+        "🤖 پنل کنترل سلف\n\n"
         "ℹ️ حذف پیام و تگ اعضا/ادمین چون باید تو یه گروه/چت خاص اجرا بشن، "
-        f"از خودِ سلف با دستورات `.حذف` و `.تگ` (یا `.پنل`) قابل استفاده‌ان، نه از اینجا.",
+        f"از خودِ سلف با دستورات .حذف و .تگ (یا .پنل) قابل استفاده‌ان، نه از اینجا.",
         reply_markup=main_menu_markup(),
     )
 
@@ -61,7 +58,7 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start = time.monotonic()
     msg = await update.message.reply_text("🏓 …")
     latency_ms = (time.monotonic() - start) * 1000
-    await msg.edit_text(f"🏓 Pong! `{latency_ms:.0f}ms`", parse_mode="Markdown")
+    await msg.edit_text(f"🏓 Pong! {latency_ms:.0f}ms", parse_mode="Markdown")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -94,9 +91,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await _handle_callback(query, data)
     except BadRequest as e:
-        # Happens when the exact same button is pressed twice in a row —
-        # Telegram refuses to "edit" a message into identical content.
-        # Harmless, just swallow it instead of logging it as a real error.
         if "message is not modified" not in str(e).lower():
             raise
 
@@ -117,13 +111,12 @@ async def _handle_callback(query, data):
     if data == "status":
         await query.edit_message_text("🟢 Control Bot فعال است", reply_markup=main_menu_markup())
         return
-
-    if data == "ping":
+[23/05/1405 11:36 ب.ظ] TMK 23:34: if data == "ping":
         start = time.monotonic()
         await query.edit_message_text("🏓 …")
         latency_ms = (time.monotonic() - start) * 1000
         await query.edit_message_text(
-            f"🏓 Pong! `{latency_ms:.0f}ms`",
+            f"🏓 Pong! {latency_ms:.0f}ms",
             reply_markup=main_menu_markup(),
             parse_mode="Markdown",
         )
@@ -160,15 +153,7 @@ async def error_handler(update, context):
 
 
 def build_app():
-    builder = Application.builder().token(BOT_TOKEN)
-
-    if PROXY_HOST:
-        proxy_url = f"socks5://{PROXY_HOST}:{PROXY_PORT}"
-        request = HTTPXRequest(proxy=proxy_url)
-        get_updates_request = HTTPXRequest(proxy=proxy_url)
-        builder = builder.request(request).get_updates_request(get_updates_request)
-
-    app = builder.build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
@@ -183,7 +168,11 @@ def build_app():
     return app
 
 
-if __name__ == "__main__":
+async def start_control_bot():
+    """Starts the control bot asynchronously alongside selfbot."""
+    app = build_app()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
     log.ok("Control Bot started")
-    log.info("Waiting for commands...")
-    build_app().run_polling()
+    return app
