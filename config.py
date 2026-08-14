@@ -28,11 +28,6 @@ PREFIX = _get("PREFIX", default=".")
 # Control bot (python-telegram-bot) token
 BOT_TOKEN = _get("BOT_TOKEN", required=True)
 
-# MTProxy Configuration (Hardcoded with your proxy details)
-MTPROTO_SERVER = "opeenhostings.co.uk."
-MTPROTO_PORT = 443
-MTPROTO_SECRET = "eef0eeb0bd9adc4fd4a93994ee3b2a216b63646e2e79656b74616e65742e636f6d"
-
 # Clock update interval in seconds. Telegram rate-limits how often a profile
 # name can change, so don't set this too low (60s is a safe default).
 CLOCK_INTERVAL_SECONDS = _get("CLOCK_INTERVAL_SECONDS", default=60, cast=int)
@@ -63,5 +58,5 @@ PORT = _get("PORT", default=8080, cast=int)
 
 
 def get_proxy():
-    """Returns a Telethon-compatible MTProto proxy tuple."""
-    return ("mtproto", MTPROTO_SERVER, MTPROTO_PORT, MTPROTO_SECRET)
+    """No proxy needed when running on cloud servers like Railway."""
+    return None
