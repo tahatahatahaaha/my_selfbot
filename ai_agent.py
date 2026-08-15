@@ -1,6 +1,6 @@
 """
 AI layer for the `.ai` command only — plain conversational chat via
-OpenRouter. Configurable API key / model / base URL / timeout, so
+OpenRouter. Configurable API key(s) / model / base URL / timeout, so
 switching models is a config change, never a code change.
 
 Agent Mode (natural-language -> command routing) has been removed
@@ -8,12 +8,16 @@ entirely; this file no longer does any JSON classification.
 """
 
 import asyncio
+import datetime
 import time
 
 import httpx
 
 from config import (
     OPENROUTER_API_KEY,
+    OPENROUTER_API_KEY_2,
+    OPENROUTER_API_KEY_3,
+    OPENROUTER_API_KEY_4,
     OPENROUTER_MODEL,
     OPENROUTER_BASE_URL,
     OPENROUTER_TIMEOUT,
@@ -24,6 +28,54 @@ from logger import log
 
 MAX_RETRIES = 2
 RETRY_BASE_DELAY = 1.0
+
+# Up to 4 keys, in the order given in .env. When a key's daily cap gets
+# hit, it's parked until the next UTC reset and calls automatically move
+# on to the next configured key — no restart, no code change.
+_api_keys = [
+    k for k in [OPENROUTER_API_KEY, OPENROUTER_API_KEY_2, OPENROUTER_API_KEY_3, OPENROUTER_API_KEY_4]
+    if k
+]
+_current_key_index = 0
+_exhausted_until = {}  # api_key -> datetime.datetime it's safe to retry again
+
+
+def has_api_key() -> bool:
+    return bool(_api_keys)
+
+
+def _mask(key: str) -> str:
+    return f"...{key[-4:]}" if len(key) > 4 else "...."
+
+
+def _next_utc_reset() -> datetime.datetime:
+    """OpenRouter's free-tier daily cap resets at UTC midnight — this is a
+    reasonable park time even when the exact reset isn't in the error
+    body; worst case a key sits idle a bit longer than strictly needed,
+    which is harmless since the other keys keep covering requests."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _mark_key_exhausted(key: str):
+    _exhausted_until[key] = _next_utc_reset()
+    log.warn(f"ai_agent: key {_mask(key)} looks daily-capped, parking it until UTC midnight")
+
+
+def _keys_to_try() -> list:
+    """All configured keys, ordered starting from _current_key_index so
+    load spreads across keys instead of always hammering the first one —
+    with any currently-parked (daily-capped) keys pushed to the back
+    instead of skipped outright, so if every key is capped we still try
+    something rather than failing immediately."""
+    if not _api_keys:
+        return []
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = _current_key_index % len(_api_keys)
+    ordered = _api_keys[start:] + _api_keys[:start]
+    fresh = [k for k in ordered if _exhausted_until.get(k, now) <= now]
+    parked = [k for k in ordered if _exhausted_until.get(k, now) > now]
+    return fresh + parked
 
 
 class _RateLimiter:
@@ -75,16 +127,17 @@ def _candidate_models() -> list:
     return [_active_model] + [m for m in OPENROUTER_FALLBACK_MODELS if m != _active_model]
 
 
-async def _call_one_model(model: str, messages, temperature: float, http: httpx.AsyncClient):
-    """Runs MAX_RETRIES attempts against a single model. Raises on total
-    failure so the caller (_call) can move on to the next fallback model."""
+async def _call_one_model(model: str, messages, temperature: float, http: httpx.AsyncClient, api_key: str):
+    """Runs MAX_RETRIES attempts against a single model with a single key.
+    Raises on total failure so the caller (_call) can move on to the next
+    fallback model — or, if every model failed with a 429, the next key."""
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
             resp = await http.post(
                 f"{OPENROUTER_BASE_URL}/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json={"model": model, "messages": messages, "temperature": temperature},
@@ -95,7 +148,7 @@ async def _call_one_model(model: str, messages, temperature: float, http: httpx.
         except httpx.HTTPStatusError as e:
             last_exc = e
             if e.response.status_code in (429, 502, 503) and attempt < MAX_RETRIES - 1:
-                log.warn(f"ai_agent: {model} -> {e.response.status_code}, retrying...")
+                log.warn(f"ai_agent: {model} ({_mask(api_key)}) -> {e.response.status_code}, retrying...")
                 await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
                 continue
             break
@@ -109,27 +162,52 @@ async def _call_one_model(model: str, messages, temperature: float, http: httpx.
 
 
 async def _call(messages, temperature=0.3):
-    """Tries the active model, then each configured fallback in order, each
-    with its own retry+backoff. Only raises once every candidate model has
-    been exhausted."""
+    """Tries each configured key in turn (starting from the current
+    rotation point); for each key, tries the active model then each
+    fallback. A key is only abandoned for the *rest of this call* once
+    every model on it has failed — and if any of those failures was a 429,
+    the key gets parked (see _mark_key_exhausted) so future calls skip it
+    until the daily reset. Only raises once every key x model combination
+    has been exhausted."""
+    global _current_key_index
+
     await _rate_limiter.acquire()
+    keys = _keys_to_try()
+    if not keys:
+        raise RuntimeError("no OpenRouter API key configured")
+
     async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as http:
         last_exc = None
-        for model in _candidate_models():
-            try:
-                return await _call_one_model(model, messages, temperature, http)
-            except Exception as e:
-                last_exc = e
-                log.warn(f"ai_agent: model {model} exhausted retries ({e}), trying next fallback if any")
-                continue
+        for key in keys:
+            key_hit_429 = False
+            for model in _candidate_models():
+                try:
+                    result = await _call_one_model(model, messages, temperature, http, key)
+                    # Success — next call starts from the key *after* this
+                    # one, so load balances forward across all keys instead
+                    # of always starting the search at key #1.
+                    _current_key_index = (_api_keys.index(key) + 1) % len(_api_keys)
+                    return result
+                except httpx.HTTPStatusError as e:
+                    last_exc = e
+                    if e.response.status_code == 429:
+                        key_hit_429 = True
+                    log.warn(f"ai_agent: model {model} on {_mask(key)} exhausted retries ({e}), trying next")
+                    continue
+                except Exception as e:
+                    last_exc = e
+                    log.warn(f"ai_agent: model {model} on {_mask(key)} exhausted retries ({e}), trying next")
+                    continue
+            if key_hit_429:
+                _mark_key_exhausted(key)
         raise last_exc
 
 
 async def health_check() -> dict:
     """Cheap connectivity probe — one tiny request. Never raises; returns
     ok=False with the error instead, so a bad key/network never crashes."""
-    if not OPENROUTER_API_KEY:
-        return {"ok": False, "model": _active_model, "error": "OPENROUTER_API_KEY not set"}
+    if not has_api_key():
+        return {"ok": False, "model": _active_model, "error": "no OPENROUTER_API_KEY* set"}
     start = time.monotonic()
     try:
         await _call([{"role": "user", "content": "ping"}], temperature=0)
@@ -148,9 +226,13 @@ def format_error(e: Exception) -> str:
                 detail = e.response.json().get("error", {}).get("message", "")
             except Exception:
                 detail = e.response.text[:200]
+            extra = ""
+            if len(_api_keys) > 1:
+                extra = f"\n\nهمه‌ی {len(_api_keys)} تا کلید تنظیم‌شده امروز به سقف خوردن."
             return (
                 "به سقف رایگان OpenRouter خوردیم (429). "
                 + (detail or "جزئیات بیشتری تو پاسخ نبود.")
+                + extra
                 + "\n\nمعمولاً یا باید چند دقیقه/تا فردا صبر کنی، یا با شارژ حداقلی "
                 "($۱۰) تو openrouter.ai سقف روزانه از ۵۰ به ۱۰۰۰ میره."
             )

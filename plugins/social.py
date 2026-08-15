@@ -15,7 +15,7 @@ TAG_BATCH_SIZE = 90  # users per message — Telegram allows ~100 entities per m
 TAG_BATCH_DELAY = 0.8  # seconds between batches — gentle pacing to avoid FloodWait
 
 
-async def _send_mass_mention(event, users, label):
+async def _send_mass_mention(event, users, label, reply_to=None):
     if not users:
         await event.edit(f"هیچ {label} پیدا نشد.")
         return
@@ -60,7 +60,9 @@ async def _send_mass_mention(event, users, label):
             continue
 
         try:
-            await client.send_message(chat_id, text, formatting_entities=entities or None, parse_mode=None)
+            await client.send_message(
+                chat_id, text, formatting_entities=entities or None, parse_mode=None, reply_to=reply_to
+            )
             tagged += batch_mention_count
         except FloodWaitError as e:
             log.warn(f"Tag flood wait, sleeping {e.seconds}s")
@@ -84,7 +86,12 @@ async def cmd_tag_members(event):
         await event.edit(f"⚠️ نتونستم لیست اعضا رو بگیرم: {e}")
         return
     users = [u for u in participants if not u.bot]
-    await _send_mass_mention(event, users, "عضو")
+    # If `.تگ اعضا` was itself sent as a reply to some message, tag the
+    # members by replying to THAT message too — so every tag batch lands
+    # threaded under the original message instead of floating loose in
+    # the chat.
+    reply_to = event.reply_to_msg_id if event.is_reply else None
+    await _send_mass_mention(event, users, "عضو", reply_to=reply_to)
 
 
 async def cmd_tag_admins(event):
@@ -94,7 +101,8 @@ async def cmd_tag_admins(event):
     except Exception as e:
         await event.edit(f"⚠️ نتونستم لیست ادمین‌ها رو بگیرم (شاید گروه ساده‌ست، نه سوپرگروه): {e}")
         return
-    await _send_mass_mention(event, admins, "ادمین")
+    reply_to = event.reply_to_msg_id if event.is_reply else None
+    await _send_mass_mention(event, admins, "ادمین", reply_to=reply_to)
 
 
 async def _block_entity(entity) -> bool:

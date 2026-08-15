@@ -1,11 +1,11 @@
 """The `.ai` plugin — direct conversational access to the AI layer."""
 
 import ai_agent
-from config import OPENROUTER_API_KEY, PREFIX
+from config import PREFIX
 
 
 async def cmd_ai(event, question: str):
-    if not OPENROUTER_API_KEY:
+    if not ai_agent.has_api_key():
         await event.edit(
             "این قابلیت فعال نیست — تو `.env` مقدار `OPENROUTER_API_KEY` رو ست کن "
             "(رایگانه: https://openrouter.ai/keys)"

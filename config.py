@@ -37,8 +37,12 @@ CLOCK_TIMEZONE = _get("CLOCK_TIMEZONE", default="Asia/Tehran")
 
 # .ai command — powered by OpenRouter, chosen so the model/key/base URL
 # are all just config, never code. Free tier: https://openrouter.ai/keys.
-# Leave OPENROUTER_API_KEY blank to disable .ai.
+# Leave all 4 blank to disable .ai. Up to 4 keys can be set — when one hits
+# its daily cap, ai_agent.py automatically rotates to the next one.
 OPENROUTER_API_KEY = _get("OPENROUTER_API_KEY", default="")
+OPENROUTER_API_KEY_2 = _get("OPENROUTER_API_KEY_2", default="")
+OPENROUTER_API_KEY_3 = _get("OPENROUTER_API_KEY_3", default="")
+OPENROUTER_API_KEY_4 = _get("OPENROUTER_API_KEY_4", default="")
 OPENROUTER_MODEL = _get("OPENROUTER_MODEL", default="qwen/qwen3-4b:free")
 OPENROUTER_BASE_URL = _get("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
 OPENROUTER_TIMEOUT = _get("OPENROUTER_TIMEOUT", default=30, cast=int)

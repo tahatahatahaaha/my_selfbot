@@ -29,12 +29,13 @@ notifying for it so Saved Messages isn't spammed with false "edits".
 
 import asyncio
 import io
+from collections import OrderedDict
 from zoneinfo import ZoneInfo
 
 from telethon import events
 from telethon.errors import FloodWaitError
 
-from config import CLOCK_TIMEZONE
+from config import CLOCK_TIMEZONE, PREFIX
 from logger import log
 
 CACHE_LIMIT_PER_CHAT = 500
@@ -48,6 +49,28 @@ NOTIFY_MAX_RETRIES = 3
 _chat_caches = {}       # chat_id -> {msg_id: entry}
 _chat_cache_order = {}  # chat_id -> [msg_id, ...] oldest -> newest
 _msg_index = {}         # msg_id -> chat_id, to route delete-event lookups
+
+# Tracks (chat_id, msg_id) for messages that WERE a `.command` you sent
+# yourself. Those get edited in place by our own handlers (a `.حذف همه`
+# progress bar can edit the same message a dozen times) — none of that is
+# real conversation worth a 500-message cache slot, so these are skipped
+# from caching entirely, from the very first edit onward. Bounded so this
+# bookkeeping itself can't grow forever.
+_OWN_COMMAND_ID_CAP = 1000
+_own_command_ids: "OrderedDict[tuple, bool]" = OrderedDict()
+
+
+def _mark_own_command(chat_id, msg_id):
+    key = (chat_id, msg_id)
+    _own_command_ids[key] = True
+    _own_command_ids.move_to_end(key)
+    if len(_own_command_ids) > _OWN_COMMAND_ID_CAP:
+        _own_command_ids.popitem(last=False)
+
+
+def _is_own_command(chat_id, msg_id) -> bool:
+    return (chat_id, msg_id) in _own_command_ids
+
 
 _control_bot_id = None          # resolved lazily, see _resolve_control_bot_id
 _control_bot_id_attempted = False
@@ -260,6 +283,27 @@ def register(client):
     async def _cache_handler(event):
         if not event.is_private:
             return
+        if event.message.out and (event.message.raw_text or "").startswith(PREFIX):
+            # This is you sending a `.command` — the selfbot is about to
+            # edit this very message in place as its reply (and possibly
+            # re-edit it several times, e.g. a delete-progress counter).
+            # None of that is conversation worth a cache slot, so skip
+            # caching it from the start and remember its id so every
+            # future edit skips too.
+            _mark_own_command(event.chat_id, event.message.id)
+            return
+
+        if not event.message.out:
+            if not _control_bot_id_attempted:
+                await _resolve_control_bot_id()
+            if _control_bot_id is not None and event.sender_id == _control_bot_id:
+                # A message FROM our own control bot (panel menus, status
+                # replies, help text) — same reasoning as the .command skip
+                # above: it's the project's own UI chatter, not real
+                # conversation, so it never enters the cache at all (not
+                # just "not reported" — genuinely never stored).
+                return
+
         # Building the cache entry can involve downloading media, which is
         # network-bound and was previously awaited right here — meaning
         # every private photo/video briefly stalled this handler before it
@@ -274,6 +318,11 @@ def register(client):
         chat_id = event.chat_id
         msg_id = event.message.id
         new_text = event.message.raw_text or ""
+
+        if _is_own_command(chat_id, msg_id):
+            # A self-issued command's own reply being edited (e.g. a
+            # `.حذف همه` progress update) — never cached, never reported.
+            return
 
         if event.message.out:
             # Outgoing edits are either you editing your own sent message,
@@ -291,10 +340,8 @@ def register(client):
         if _control_bot_id is not None and event.sender_id == _control_bot_id:
             # Edits from THIS project's own control bot (its status/menu
             # messages get edited constantly as panel buttons are pressed)
-            # are noise, not something to report. Deliberately keyed on the
-            # specific resolved id, not on "sender is any bot" — edits from
-            # other bots still get saved like anyone else's.
-            asyncio.create_task(_cache_in_background(event))
+            # were never cached in the first place (see _cache_handler
+            # above) — so there's nothing to refresh or report here either.
             return
 
         cache = _chat_caches.get(chat_id)
