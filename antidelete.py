@@ -30,6 +30,7 @@ notifying for it so Saved Messages isn't spammed with false "edits".
 import asyncio
 import io
 from collections import OrderedDict
+from datetime import datetime as _dt
 from zoneinfo import ZoneInfo
 
 from telethon import events
@@ -276,6 +277,80 @@ async def _cache_in_background(event):
         log.error(f"Anti-delete cache error: {e}")
 
 
+async def _save_full_conversation(client, chat_id, all_entries):
+    """Saves the full cached conversation to a .txt file and sends it to
+    Saved Messages. Called only on a detected full 2-sided PV deletion."""
+    try:
+        # Sort by message date (oldest first)
+        def _date_key(item):
+            d = item[1].get("date")
+            return d if d is not None else _dt.min.replace(tzinfo=None)
+
+        all_entries_sorted = sorted(all_entries, key=_date_key)
+
+        chat_label = await _resolve_label(client, chat_id)
+        me_entity = await client.get_me()
+        my_name = getattr(me_entity, "first_name", None) or "من"
+        now_str = _dt.now(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+
+        lines = [
+            f"مکالمه‌ی حذف‌شده با {chat_label}",
+            f"تاریخ ذخیره‌سازی: {now_str}",
+            f"تعداد پیام: {len(all_entries_sorted)}",
+            "─" * 40,
+            "",
+        ]
+
+        for _mid, entry in all_entries_sorted:
+            date_obj = entry.get("date")
+            if date_obj is not None:
+                try:
+                    time_str = date_obj.astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    time_str = str(date_obj)
+            else:
+                time_str = "?"
+
+            sender = my_name if entry["out"] else chat_label
+            text = entry.get("text") or ""
+
+            media_note = ""
+            if entry.get("media_bytes"):
+                media_note = " [رسانه]"
+            elif entry.get("media_too_large"):
+                media_note = " [رسانه — بزرگ‌تر از حد کش]"
+
+            fwd_note = ""
+            if entry.get("fwd_from_name"):
+                fwd_note = f" [فوروارد از: {entry['fwd_from_name']}]"
+
+            body = text or "(بدون متن)"
+            lines.append(f"[{time_str}] {sender}{fwd_note}{media_note}:")
+            lines.append(f"  {body}")
+            lines.append("")
+
+        content = "\n".join(lines)
+        buf = io.BytesIO(content.encode("utf-8"))
+        filename = f"chat_{chat_label}_{now_str[:10]}.txt".replace(" ", "_")
+
+        await client.send_file(
+            "me",
+            buf,
+            caption=(
+                f"🗂 **مکالمه‌ی PV با {chat_label} دوطرفه حذف شد**\n"
+                f"📝 {len(all_entries_sorted)} پیام در فایل ذخیره شد\n"
+                f"🕒 {now_str}"
+            ),
+            file_name=filename,
+        )
+        log.ok(
+            f"Anti-delete: full conversation with {chat_label} "
+            f"({len(all_entries_sorted)} messages) saved to file"
+        )
+    except Exception as e:
+        log.error(f"Anti-delete: failed to save full conversation for chat {chat_id}: {e}")
+
+
 def register(client):
     """Call once with the running TelegramClient to enable anti-delete."""
 
@@ -325,12 +400,9 @@ def register(client):
             return
 
         if event.message.out:
-            # Outgoing edits are either you editing your own sent message,
-            # or this very script editing its own command replies (.پنل,
-            # .ping, etc. all call event.edit() under the hood) — neither
-            # is something you want reported to Saved Messages. Still
-            # refresh the cache so a later delete of this message reports
-            # the *current* (edited) text, not the stale original.
+            # Outgoing edits — you edited your own message. Nothing to report;
+            # just refresh the cache so if the message later gets deleted the
+            # most recent text is stored (not the stale original).
             asyncio.create_task(_cache_in_background(event))
             return
 
@@ -371,10 +443,42 @@ def register(client):
     async def _delete_handler(event):
         if not event.deleted_ids:
             return
+
+        # Pop every deleted id from the cache.
+        hits = []
         for msg_id in event.deleted_ids:
             data = _pop(msg_id)
-            if data is None:
-                continue
+            if data is not None:
+                hits.append((msg_id, data))
+
+        if not hits:
+            return
+
+        own_hits   = [(mid, d) for mid, d in hits if     d["out"]]
+        other_hits = [(mid, d) for mid, d in hits if not d["out"]]
+
+        # ── Full 2-sided PV deletion ──────────────────────────────────────
+        # The only way a single delete-event batch can contain messages from
+        # BOTH sides is a "delete for everyone" on the whole chat. In that
+        # case we save the entire cached conversation to a .txt file instead
+        # of sending individual Saved-Messages notifications.
+        if own_hits and other_hits:
+            chat_id = hits[0][1]["chat_id"]
+            # Grab any remaining messages still in the cache for this chat
+            # (the batch may not cover all 500 cached entries — pull the rest).
+            remaining = list(_chat_caches.get(chat_id, {}).items())
+            all_entries = hits + remaining
+            asyncio.create_task(_save_full_conversation(client, chat_id, all_entries))
+            return
+
+        # ── User deleted their own message ────────────────────────────────
+        # You consciously chose to delete it — nothing to report.
+        if own_hits and not other_hits:
+            return
+
+        # ── Other person deleted their message ────────────────────────────
+        # Report each one to Saved Messages, with the usual flood-wait guard.
+        for msg_id, data in other_hits:
             await _notify_with_retry(client, data, msg_id)
             await asyncio.sleep(NOTIFY_DELAY)
 
