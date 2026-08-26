@@ -76,6 +76,12 @@ def _is_own_command(chat_id, msg_id) -> bool:
 _control_bot_id = None          # resolved lazily, see _resolve_control_bot_id
 _control_bot_id_attempted = False
 
+# Extra bots whose messages should never be cached or reported.
+# Resolved lazily by username on first private message received.
+_EXTRA_EXCLUDE_USERNAMES = {"TMKselfbot"}
+_excluded_bot_ids: set = set()
+_excluded_resolved = False
+
 
 async def _resolve_control_bot_id():
     """Resolves BOT_TOKEN's own numeric user id, once, via the Bot API's
@@ -101,6 +107,21 @@ async def _resolve_control_bot_id():
         log.ok(f"Anti-edit: resolved control bot id ({_control_bot_id}) — its edits won't post to Saved Messages")
     except Exception as e:
         log.warn(f"Anti-edit: couldn't resolve control bot id via getMe, exclusion unavailable: {e}")
+
+
+async def _resolve_excluded_bots(client):
+    """Resolve extra excluded bot usernames (e.g. @TMKselfbot) to their
+    numeric ids so the cache handler can skip them by id — much cheaper
+    than a username string-compare on every single incoming message."""
+    global _excluded_resolved
+    _excluded_resolved = True
+    for username in _EXTRA_EXCLUDE_USERNAMES:
+        try:
+            entity = await client.get_entity(username)
+            _excluded_bot_ids.add(entity.id)
+            log.ok(f"Anti-delete: excluding messages from @{username} (id {entity.id})")
+        except Exception as e:
+            log.warn(f"Anti-delete: couldn't resolve @{username}: {e}")
 
 
 def _remember(chat_id, msg_id, entry):
@@ -278,74 +299,129 @@ async def _cache_in_background(event):
 
 
 async def _save_full_conversation(client, chat_id, all_entries):
-    """Saves the full cached conversation to a .txt file and sends it to
-    Saved Messages. Called only on a detected full 2-sided PV deletion."""
+    """Saves the full cached conversation as a styled HTML file and sends
+    it to Saved Messages. Called only on a detected full 2-sided PV deletion.
+    HTML renders properly in both mobile browsers and desktop browsers —
+    unlike .txt which has no formatting, or .pdf which can be slow on mobile."""
     try:
-        # Sort by message date (oldest first)
-        def _date_key(item):
-            d = item[1].get("date")
-            return d if d is not None else _dt.min.replace(tzinfo=None)
-
-        all_entries_sorted = sorted(all_entries, key=_date_key)
+        all_entries_sorted = sorted(
+            all_entries,
+            key=lambda item: item[1].get("date") or _dt.min.replace(tzinfo=None)
+        )
 
         chat_label = await _resolve_label(client, chat_id)
         me_entity = await client.get_me()
         my_name = getattr(me_entity, "first_name", None) or "من"
         now_str = _dt.now(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+        count = len(all_entries_sorted)
 
-        lines = [
-            f"مکالمه‌ی حذف‌شده با {chat_label}",
-            f"تاریخ ذخیره‌سازی: {now_str}",
-            f"تعداد پیام: {len(all_entries_sorted)}",
-            "─" * 40,
-            "",
-        ]
+        def _esc(s: str) -> str:
+            """Minimal HTML escaping so message text can't break the markup."""
+            return (s.replace("&", "&amp;")
+                     .replace("<", "&lt;")
+                     .replace(">", "&gt;")
+                     .replace('"', "&quot;")
+                     .replace("\n", "<br>"))
 
+        msg_html_parts = []
         for _mid, entry in all_entries_sorted:
+            is_out = entry["out"]
             date_obj = entry.get("date")
             if date_obj is not None:
                 try:
-                    time_str = date_obj.astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+                    time_str = date_obj.astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%H:%M")
+                    date_full = date_obj.astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
-                    time_str = str(date_obj)
+                    time_str = "?"
+                    date_full = "?"
             else:
-                time_str = "?"
+                time_str = date_full = "?"
 
-            sender = my_name if entry["out"] else chat_label
-            text = entry.get("text") or ""
+            sender = my_name if is_out else chat_label
+            text = _esc(entry.get("text") or "")
 
-            media_note = ""
-            if entry.get("media_bytes"):
-                media_note = " [رسانه]"
-            elif entry.get("media_too_large"):
-                media_note = " [رسانه — بزرگ‌تر از حد کش]"
-
-            fwd_note = ""
+            extras = []
             if entry.get("fwd_from_name"):
-                fwd_note = f" [فوروارد از: {entry['fwd_from_name']}]"
+                extras.append(f'<div class="fwd">↪️ فوروارد از: {_esc(entry["fwd_from_name"])}</div>')
+            if entry.get("media_bytes"):
+                extras.append('<div class="media-note">📎 رسانه (در فایل ذخیره نشد)</div>')
+            elif entry.get("media_too_large"):
+                extras.append('<div class="media-note">📎 رسانه — بزرگ‌تر از حد کش</div>')
 
-            body = text or "(بدون متن)"
-            lines.append(f"[{time_str}] {sender}{fwd_note}{media_note}:")
-            lines.append(f"  {body}")
-            lines.append("")
+            direction = "out" if is_out else "in"
+            msg_html_parts.append(
+                f'<div class="msg {direction}">'
+                f'<div class="bubble">'
+                f'<div class="sender">{_esc(sender)}</div>'
+                + "".join(extras)
+                + (f'<div class="text">{text}</div>' if text else "")
+                + f'<div class="time" title="{date_full}">{time_str}</div>'
+                f'</div></div>'
+            )
 
-        content = "\n".join(lines)
-        buf = io.BytesIO(content.encode("utf-8"))
-        filename = f"chat_{chat_label}_{now_str[:10]}.txt".replace(" ", "_")
+        messages_html = "\n".join(msg_html_parts)
+
+        html = f"""<!DOCTYPE html>
+<html dir="rtl" lang="fa">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>مکالمه با {_esc(chat_label)}</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: Tahoma, Arial, sans-serif; background: #e5ddd5;
+          min-height: 100vh; padding: 8px; }}
+  .header {{ background: #075e54; color: white; padding: 14px 18px;
+             border-radius: 10px; margin-bottom: 12px; text-align: center; }}
+  .header h2 {{ font-size: 1.1em; margin-bottom: 4px; }}
+  .header p  {{ font-size: 0.85em; opacity: .85; }}
+  .messages {{ max-width: 680px; margin: 0 auto; }}
+  .msg {{ display: flex; margin: 3px 0; }}
+  .msg.out {{ justify-content: flex-end; }}
+  .msg.in  {{ justify-content: flex-start; }}
+  .bubble {{ max-width: 72%; padding: 7px 11px 4px;
+             border-radius: 12px; font-size: 14px;
+             line-height: 1.55; word-wrap: break-word; }}
+  .msg.out .bubble {{ background: #dcf8c6; border-bottom-right-radius: 3px; }}
+  .msg.in  .bubble {{ background: #ffffff; border-bottom-left-radius: 3px; }}
+  .sender {{ font-size: 12px; color: #075e54; font-weight: bold;
+             margin-bottom: 3px; }}
+  .msg.out .sender {{ color: #1a7a4a; }}
+  .text {{ white-space: pre-wrap; }}
+  .time {{ font-size: 11px; color: #8a8a8a; text-align: left;
+           margin-top: 3px; direction: ltr; }}
+  .fwd {{ font-size: 12px; color: #5b7fa6; border-right: 3px solid #5b7fa6;
+          padding-right: 6px; margin-bottom: 4px; }}
+  .media-note {{ font-size: 12px; color: #888; font-style: italic; margin: 3px 0; }}
+</style>
+</head>
+<body>
+<div class="header">
+  <h2>🗂 مکالمه با {_esc(chat_label)}</h2>
+  <p>📝 {count} پیام &nbsp;|&nbsp; 🕒 {_esc(now_str)}</p>
+</div>
+<div class="messages">
+{messages_html}
+</div>
+</body>
+</html>"""
+
+        buf = io.BytesIO(html.encode("utf-8"))
+        filename = f"chat_{chat_label}_{now_str[:10]}.html".replace(" ", "_")
 
         await client.send_file(
             "me",
             buf,
             caption=(
                 f"🗂 **مکالمه‌ی PV با {chat_label} دوطرفه حذف شد**\n"
-                f"📝 {len(all_entries_sorted)} پیام در فایل ذخیره شد\n"
+                f"📝 {count} پیام در فایل ذخیره شد\n"
                 f"🕒 {now_str}"
             ),
             file_name=filename,
         )
         log.ok(
             f"Anti-delete: full conversation with {chat_label} "
-            f"({len(all_entries_sorted)} messages) saved to file"
+            f"({count} messages) saved as HTML"
         )
     except Exception as e:
         log.error(f"Anti-delete: failed to save full conversation for chat {chat_id}: {e}")
@@ -372,11 +448,13 @@ def register(client):
             if not _control_bot_id_attempted:
                 await _resolve_control_bot_id()
             if _control_bot_id is not None and event.sender_id == _control_bot_id:
-                # A message FROM our own control bot (panel menus, status
-                # replies, help text) — same reasoning as the .command skip
-                # above: it's the project's own UI chatter, not real
-                # conversation, so it never enters the cache at all (not
-                # just "not reported" — genuinely never stored).
+                return
+
+            if not _excluded_resolved:
+                await _resolve_excluded_bots(client)
+            if event.sender_id in _excluded_bot_ids:
+                # e.g. @TMKselfbot — its messages are bot-generated UI
+                # chatter, not real conversation worth caching or reporting.
                 return
 
         # Building the cache entry can involve downloading media, which is
@@ -410,10 +488,11 @@ def register(client):
             await _resolve_control_bot_id()
 
         if _control_bot_id is not None and event.sender_id == _control_bot_id:
-            # Edits from THIS project's own control bot (its status/menu
-            # messages get edited constantly as panel buttons are pressed)
-            # were never cached in the first place (see _cache_handler
-            # above) — so there's nothing to refresh or report here either.
+            return
+
+        if not _excluded_resolved:
+            await _resolve_excluded_bots(client)
+        if event.sender_id in _excluded_bot_ids:
             return
 
         cache = _chat_caches.get(chat_id)

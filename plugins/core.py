@@ -53,6 +53,13 @@ async def cmd_font(event, arg):
     elif arg in ("off", "none"):
         fontstyle.set_font(None)
         await event.edit("🔠 استایل فونت **خاموش** شد.")
+    elif arg == "on":
+        restored = fontstyle.restore_font()
+        if restored:
+            label = fontstyle.FONTS[restored][0]
+            await event.edit(f"🔠 فونت **{label}** دوباره فعال شد.")
+        else:
+            await event.edit(f"🔠 فونت قبلی‌ای تو حافظه نیست — یه فونت انتخاب کن: `{PREFIX}font list`")
     elif arg == "list":
         names = "\n".join(f"• `{key}` — {label}" for key, (label, _) in fontstyle.FONTS.items())
         await event.edit(f"🔠 فونت‌های موجود:\n{names}")
