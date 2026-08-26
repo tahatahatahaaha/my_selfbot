@@ -251,30 +251,21 @@ async def _send_cached_media(client, entity, data, caption):
 
 
 async def _notify(client, data):
-    chat_label = await _resolve_label(client, data["chat_id"])
     sender_label = "خودت" if data["out"] else await _resolve_label(client, data["sender_id"])
     date_label = (
         data["date"].astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
         if data["date"]
         else "?"
     )
-
-    header = (
-        "🗑 **یه پیام تو PV حذف شد**\n"
-        f"👤 چت: {chat_label}\n"
-        f"✍️ فرستنده: {sender_label}\n"
-        f"🕒 زمان ارسال: {date_label}"
-    )
-    if data["fwd_from_name"]:
-        header += f"\n↪️ فوروارد شده از: {data['fwd_from_name']}"
-    if data["media_too_large"]:
-        header += "\n⚠️ رسانه بزرگ‌تر از حد مجاز بود، فقط متن کش شد."
+    header = f"👤 {sender_label}\n🕒 {date_label}"
 
     if data["media_bytes"]:
         caption = header + (f"\n\n{data['text']}" if data["text"] else "")
         await _send_cached_media(client, "me", data, caption)
+    elif data["media_too_large"]:
+        await client.send_message("me", header + "\n\n⚠️ رسانه بزرگ‌تر از حد مجاز بود.")
     else:
-        body = header + (f"\n\n{data['text']}" if data["text"] else "\n\n(بدون متن)")
+        body = header + (f"\n\n{data['text']}" if data["text"] else "")
         await client.send_message("me", body)
 
 
@@ -344,133 +335,40 @@ async def _cache_in_background(event):
         log.error(f"Anti-delete cache error: {e}")
 
 
-async def _save_full_conversation(client, chat_id, all_entries):
-    """Saves the full cached conversation as a styled HTML file and sends
-    it to Saved Messages. Called only on a detected full 2-sided PV deletion.
-    HTML renders properly in both mobile browsers and desktop browsers —
-    unlike .txt which has no formatting, or .pdf which can be slow on mobile."""
+async def _resend_full_conversation(client, chat_id, all_entries):
+    """Called when a full 2-sided PV deletion is detected (a batch
+    containing messages from BOTH sides can only mean "delete for
+    everyone" on the whole chat). This used to build a styled HTML chat
+    export and send it as a .html file — but Telegram's in-app HTML
+    viewer on mobile is unreliable (spins forever, never actually opens),
+    and the export didn't even include the real media, just a placeholder
+    note saying media existed. Just resending each cached message
+    natively — same plain sender+time format as a normal single delete —
+    opens correctly everywhere with no extra viewer involved."""
+    all_entries_sorted = sorted(
+        all_entries,
+        key=lambda item: item[1].get("date") or _dt.min.replace(tzinfo=None),
+    )
+    chat_label = await _resolve_label(client, chat_id)
+    count = len(all_entries_sorted)
+
     try:
-        all_entries_sorted = sorted(
-            all_entries,
-            key=lambda item: item[1].get("date") or _dt.min.replace(tzinfo=None)
-        )
-
-        chat_label = await _resolve_label(client, chat_id)
-        me_entity = await client.get_me()
-        my_name = getattr(me_entity, "first_name", None) or "من"
-        now_str = _dt.now(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
-        count = len(all_entries_sorted)
-
-        def _esc(s: str) -> str:
-            """Minimal HTML escaping so message text can't break the markup."""
-            return (s.replace("&", "&amp;")
-                     .replace("<", "&lt;")
-                     .replace(">", "&gt;")
-                     .replace('"', "&quot;")
-                     .replace("\n", "<br>"))
-
-        msg_html_parts = []
-        for _mid, entry in all_entries_sorted:
-            is_out = entry["out"]
-            date_obj = entry.get("date")
-            if date_obj is not None:
-                try:
-                    time_str = date_obj.astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%H:%M")
-                    date_full = date_obj.astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    time_str = "?"
-                    date_full = "?"
-            else:
-                time_str = date_full = "?"
-
-            sender = my_name if is_out else chat_label
-            text = _esc(entry.get("text") or "")
-
-            extras = []
-            if entry.get("fwd_from_name"):
-                extras.append(f'<div class="fwd">↪️ فوروارد از: {_esc(entry["fwd_from_name"])}</div>')
-            if entry.get("media_bytes"):
-                extras.append('<div class="media-note">📎 رسانه (در فایل ذخیره نشد)</div>')
-            elif entry.get("media_too_large"):
-                extras.append('<div class="media-note">📎 رسانه — بزرگ‌تر از حد کش</div>')
-
-            direction = "out" if is_out else "in"
-            msg_html_parts.append(
-                f'<div class="msg {direction}">'
-                f'<div class="bubble">'
-                f'<div class="sender">{_esc(sender)}</div>'
-                + "".join(extras)
-                + (f'<div class="text">{text}</div>' if text else "")
-                + f'<div class="time" title="{date_full}">{time_str}</div>'
-                f'</div></div>'
-            )
-
-        messages_html = "\n".join(msg_html_parts)
-
-        html = f"""<!DOCTYPE html>
-<html dir="rtl" lang="fa">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>مکالمه با {_esc(chat_label)}</title>
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: Tahoma, Arial, sans-serif; background: #e5ddd5;
-          min-height: 100vh; padding: 8px; }}
-  .header {{ background: #075e54; color: white; padding: 14px 18px;
-             border-radius: 10px; margin-bottom: 12px; text-align: center; }}
-  .header h2 {{ font-size: 1.1em; margin-bottom: 4px; }}
-  .header p  {{ font-size: 0.85em; opacity: .85; }}
-  .messages {{ max-width: 680px; margin: 0 auto; }}
-  .msg {{ display: flex; margin: 3px 0; }}
-  .msg.out {{ justify-content: flex-end; }}
-  .msg.in  {{ justify-content: flex-start; }}
-  .bubble {{ max-width: 72%; padding: 7px 11px 4px;
-             border-radius: 12px; font-size: 14px;
-             line-height: 1.55; word-wrap: break-word; }}
-  .msg.out .bubble {{ background: #dcf8c6; border-bottom-right-radius: 3px; }}
-  .msg.in  .bubble {{ background: #ffffff; border-bottom-left-radius: 3px; }}
-  .sender {{ font-size: 12px; color: #075e54; font-weight: bold;
-             margin-bottom: 3px; }}
-  .msg.out .sender {{ color: #1a7a4a; }}
-  .text {{ white-space: pre-wrap; }}
-  .time {{ font-size: 11px; color: #8a8a8a; text-align: left;
-           margin-top: 3px; direction: ltr; }}
-  .fwd {{ font-size: 12px; color: #5b7fa6; border-right: 3px solid #5b7fa6;
-          padding-right: 6px; margin-bottom: 4px; }}
-  .media-note {{ font-size: 12px; color: #888; font-style: italic; margin: 3px 0; }}
-</style>
-</head>
-<body>
-<div class="header">
-  <h2>🗂 مکالمه با {_esc(chat_label)}</h2>
-  <p>📝 {count} پیام &nbsp;|&nbsp; 🕒 {_esc(now_str)}</p>
-</div>
-<div class="messages">
-{messages_html}
-</div>
-</body>
-</html>"""
-
-        buf = io.BytesIO(html.encode("utf-8"))
-        filename = f"chat_{chat_label}_{now_str[:10]}.html".replace(" ", "_")
-
-        await client.send_file(
-            "me",
-            buf,
-            caption=(
-                f"🗂 **مکالمه‌ی PV با {chat_label} دوطرفه حذف شد**\n"
-                f"📝 {count} پیام در فایل ذخیره شد\n"
-                f"🕒 {now_str}"
-            ),
-            file_name=filename,
-        )
-        log.ok(
-            f"Anti-delete: full conversation with {chat_label} "
-            f"({count} messages) saved as HTML"
-        )
+        await client.send_message("me", f"🗑 مکالمه با {chat_label} دوطرفه حذف شد — {count} پیام:")
     except Exception as e:
-        log.error(f"Anti-delete: failed to save full conversation for chat {chat_id}: {e}")
+        log.error(f"Anti-delete: couldn't send conversation-deleted header: {e}")
+
+    for _mid, data in all_entries_sorted:
+        try:
+            await _notify(client, data)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            try:
+                await _notify(client, data)
+            except Exception as e2:
+                log.error(f"Anti-delete: couldn't resend a message from deleted conversation: {e2}")
+        except Exception as e:
+            log.error(f"Anti-delete: couldn't resend a message from deleted conversation: {e}")
+        await asyncio.sleep(NOTIFY_DELAY)
 
 
 def register(client):
@@ -593,7 +491,7 @@ def register(client):
             # (the batch may not cover all 500 cached entries — pull the rest).
             remaining = list(_chat_caches.get(chat_id, {}).items())
             all_entries = hits + remaining
-            asyncio.create_task(_save_full_conversation(client, chat_id, all_entries))
+            asyncio.create_task(_resend_full_conversation(client, chat_id, all_entries))
             return
 
         # ── User deleted their own message ────────────────────────────────
