@@ -6,7 +6,8 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 import clock
 import fontstyle
-from config import BOT_TOKEN
+import persian_date
+from config import BOT_TOKEN, CLOCK_TIMEZONE
 from help_text import HELP_TEXT
 from logger import log
 from telegram_layer import client as tg_client
@@ -24,7 +25,8 @@ def main_menu_markup():
             InlineKeyboardButton("⏰ Clock ON", callback_data="clock_on"),
             InlineKeyboardButton("⏰ Clock OFF", callback_data="clock_off"),
         ],
-        [InlineKeyboardButton("🔤 فونت", callback_data="menu:font")],
+        [InlineKeyboardButton("📅 تاریخ امروز", callback_data="today")],
+        [InlineKeyboardButton("🔤 فونت‌ها", callback_data="menu:font")],
         [InlineKeyboardButton("📖 راهنما", callback_data="help")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -46,11 +48,17 @@ def font_menu_markup():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 پنل کنترل سلف\n\n"
+        "🤖 **پنل کنترل سلف**\n"
+        "از دکمه‌های پایین استفاده کن 👇\n\n"
         "ℹ️ حذف پیام و تگ اعضا/ادمین چون باید تو یه گروه/چت خاص اجرا بشن، "
         f"از خودِ سلف با دستورات .حذف و .تگ (یا .پنل) قابل استفاده‌ان، نه از اینجا.",
+        parse_mode="Markdown",
         reply_markup=main_menu_markup(),
     )
+
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(persian_date.today_string(CLOCK_TIMEZONE), reply_markup=main_menu_markup())
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,6 +118,9 @@ async def _handle_callback(query, data):
     if data == "status":
         await query.edit_message_text("🟢 Control Bot فعال است", reply_markup=main_menu_markup())
         return
+    if data == "today":
+        await query.edit_message_text(persian_date.today_string(CLOCK_TIMEZONE), reply_markup=main_menu_markup())
+        return
     if data == "ping":
         start = time.monotonic()
         await query.edit_message_text("🏓 …")
@@ -160,6 +171,7 @@ def build_app():
     app.add_handler(CommandHandler("clock_on", clock_on))
     app.add_handler(CommandHandler("clock_off", clock_off))
     app.add_handler(CommandHandler("font", font_command))
+    app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(error_handler)

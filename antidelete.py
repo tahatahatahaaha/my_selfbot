@@ -162,6 +162,10 @@ async def _build_cache_entry(event):
 
     media_bytes = None
     media_too_large = False
+    media_attributes = None
+    media_mime_type = None
+    media_is_photo = False
+    media_file_name = None
     if msg.media:
         size = None
         try:
@@ -176,6 +180,21 @@ async def _build_cache_entry(event):
                 buf = io.BytesIO()
                 await msg.download_media(file=buf)
                 media_bytes = buf.getvalue()
+                # Re-uploading later with NO attributes/mime-type at all
+                # forces Telegram to guess the file type from scratch —
+                # in practice that usually means videos land as a generic
+                # document with no supports_streaming flag, so they can't
+                # be played inline and have to fully download first (slow
+                # or outright fails to open on some phones). Keeping the
+                # ORIGINAL attributes (resolution, duration, streaming
+                # flag, voice/round-video flags, etc.) and passing them
+                # straight through on resend fixes that completely.
+                if msg.photo:
+                    media_is_photo = True
+                elif msg.document:
+                    media_attributes = msg.document.attributes
+                    media_mime_type = msg.document.mime_type
+                    media_file_name = getattr(msg.file, "name", None)
             except Exception as e:
                 log.warn(f"Anti-delete: couldn't cache media for msg {msg.id}: {e}")
 
@@ -191,6 +210,10 @@ async def _build_cache_entry(event):
         "fwd_from_name": fwd_from_name,
         "media_bytes": media_bytes,
         "media_too_large": media_too_large,
+        "media_attributes": media_attributes,
+        "media_mime_type": media_mime_type,
+        "media_is_photo": media_is_photo,
+        "media_file_name": media_file_name,
     }
 
 
@@ -202,6 +225,29 @@ async def _resolve_label(client, entity_id):
         return getattr(entity, "first_name", None) or getattr(entity, "title", None) or str(entity_id)
     except Exception:
         return str(entity_id)
+
+
+async def _send_cached_media(client, entity, data, caption):
+    """Resends cached media in a form Telegram can actually stream/preview
+    properly — passing through the ORIGINAL attributes/mime-type (or
+    marking it as a photo) instead of letting Telegram guess from raw
+    bytes with no hints, which is what made resent videos land as
+    unstreamable generic documents."""
+    bio = io.BytesIO(data["media_bytes"])
+    if data.get("media_file_name"):
+        bio.name = data["media_file_name"]
+
+    if data.get("media_is_photo"):
+        await client.send_file(entity, bio, caption=caption[:1024], force_document=False)
+    else:
+        await client.send_file(
+            entity,
+            bio,
+            caption=caption[:1024],
+            attributes=data.get("media_attributes"),
+            mime_type=data.get("media_mime_type"),
+            force_document=False,
+        )
 
 
 async def _notify(client, data):
@@ -226,7 +272,7 @@ async def _notify(client, data):
 
     if data["media_bytes"]:
         caption = header + (f"\n\n{data['text']}" if data["text"] else "")
-        await client.send_file("me", io.BytesIO(data["media_bytes"]), caption=caption[:1024])
+        await _send_cached_media(client, "me", data, caption)
     else:
         body = header + (f"\n\n{data['text']}" if data["text"] else "\n\n(بدون متن)")
         await client.send_message("me", body)
@@ -270,7 +316,7 @@ async def _notify_edit(client, old_entry, new_text, new_date):
     body = header + f"\n\n🔴 قبل از ویرایش:\n{old_text}" + f"\n\n🟢 بعد از ویرایش:\n{new_text_label}"
 
     if old_entry.get("media_bytes"):
-        await client.send_file("me", io.BytesIO(old_entry["media_bytes"]), caption=body[:1024])
+        await _send_cached_media(client, "me", old_entry, body)
     else:
         await client.send_message("me", body)
 

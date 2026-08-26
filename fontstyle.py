@@ -45,6 +45,52 @@ _small_caps_map = {
 }
 _small_caps_map.update({k.upper(): v for k, v in _small_caps_map.items()})
 
+
+def _upper_only_map(base: int, digit_base=None) -> dict:
+    """For Unicode blocks that only define uppercase glyphs (squared,
+    negative-squared, negative-circled, regional-indicator letters) —
+    lowercase input maps to the same all-caps-looking glyph, matching how
+    every popular 'fancy text' generator handles these styles."""
+    m = {}
+    for i, ch in enumerate(string.ascii_uppercase):
+        glyph = chr(base + i)
+        m[ch] = glyph
+        m[ch.lower()] = glyph
+    if digit_base is not None:
+        for i, ch in enumerate(string.digits):
+            m[ch] = chr(digit_base + i)
+    return m
+
+
+# Superscript/subscript letters aren't a contiguous Unicode block — several
+# letters (mostly consonants) simply have no standard superscript/subscript
+# form and are left as-is below, same as other fancy-text generators do.
+_superscript_map = {
+    "a": "ᵃ", "b": "ᵇ", "c": "ᶜ", "d": "ᵈ", "e": "ᵉ", "f": "ᶠ", "g": "ᵍ",
+    "h": "ʰ", "i": "ⁱ", "j": "ʲ", "k": "ᵏ", "l": "ˡ", "m": "ᵐ", "n": "ⁿ",
+    "o": "ᵒ", "p": "ᵖ", "r": "ʳ", "s": "ˢ", "t": "ᵗ", "u": "ᵘ", "v": "ᵛ",
+    "w": "ʷ", "x": "ˣ", "y": "ʸ", "z": "ᶻ",
+    "A": "ᴬ", "B": "ᴮ", "D": "ᴰ", "E": "ᴱ", "G": "ᴳ", "H": "ᴴ", "I": "ᴵ",
+    "J": "ᴶ", "K": "ᴷ", "L": "ᴸ", "M": "ᴹ", "N": "ᴺ", "O": "ᴼ", "P": "ᴾ",
+    "R": "ᴿ", "T": "ᵀ", "U": "ᵁ", "V": "ⱽ", "W": "ᵂ",
+    "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+    "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
+    "+": "⁺", "-": "⁻", "=": "⁼",
+}
+
+_subscript_map = {
+    "a": "ₐ", "e": "ₑ", "h": "ₕ", "i": "ᵢ", "j": "ⱼ", "k": "ₖ", "l": "ₗ",
+    "m": "ₘ", "n": "ₙ", "o": "ₒ", "p": "ₚ", "r": "ᵣ", "s": "ₛ", "t": "ₜ",
+    "u": "ᵤ", "v": "ᵥ", "x": "ₓ",
+    "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄",
+    "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+    "+": "₊", "-": "₋", "=": "₌",
+}
+# Uppercase falls back to the lowercase subscript glyph (no uppercase
+# subscript letters exist in Unicode at all) — same convention every
+# fancy-text generator uses for this style.
+_subscript_map.update({k.upper(): v for k, v in _subscript_map.items() if k.isalpha()})
+
 # key -> (display name shown in the panel, char map)
 FONTS = {
     "bold":            ("𝗕𝗼𝗹𝗱",           _range_map(0x1D400, 0x1D41A, 0x1D7CE)),
@@ -74,6 +120,12 @@ FONTS = {
     "small_caps":      ("Sᴍᴀʟʟ Cᴀᴘs",   dict(_small_caps_map)),
     "strikethrough":   ("S̶t̶r̶i̶k̶e̶",       _combining_map("\u0336")),
     "underline":       ("U̲n̲d̲e̲r̲l̲i̲n̲e̲",    _combining_map("\u0332")),
+    "squared":         ("🅂🄰🄼🄿🄻🄴",       _upper_only_map(0x1F130)),
+    "negative_squared":("🆂🅰🅼🅿🅻🅴",       _upper_only_map(0x1F170)),
+    "negative_circled":("🅢🅐🅜🅟🅛🅔",       _upper_only_map(0x1F150)),
+    "regional":        ("🇸🇦🇲🇵🇱🇪",         _upper_only_map(0x1F1E6)),
+    "superscript":     ("ˢᵃᵐᵖˡᵉ",         dict(_superscript_map)),
+    "subscript":       ("ₛₐₘₚₗₑ",         dict(_subscript_map)),
 }
 
 # _state tracks the active font key AND the last non-None key, so
