@@ -38,6 +38,7 @@ from telethon.errors import FloodWaitError
 
 from config import CLOCK_TIMEZONE, PREFIX
 from logger import log
+import group_inbox
 
 CACHE_LIMIT_PER_CHAT = 500
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # 20MB — skip downloading bigger media
@@ -229,28 +230,47 @@ async def _resolve_label(client, entity_id):
 
 async def _send_cached_media(client, entity, data, caption):
     """Resends cached media in a form Telegram can actually stream/preview
-    properly — passing through the ORIGINAL attributes/mime-type (or
-    marking it as a photo) instead of letting Telegram guess from raw
-    bytes with no hints, which is what made resent videos land as
-    unstreamable generic documents."""
+    properly on both desktop and mobile.
+
+    The mobile-not-opening bug: when we pass a bare BytesIO with no name,
+    Telethon has no way to know the file is a photo even when the original
+    was one — so it uploads it as a generic document. Telegram then sends
+    a 'file' icon, not an inline image, and the phone's viewer has to
+    download the whole thing before even deciding what to do with it.
+    Setting bio.name to a real image extension tells Telethon what type to
+    use without needing to re-infer it from the raw bytes."""
     bio = io.BytesIO(data["media_bytes"])
-    if data.get("media_file_name"):
-        bio.name = data["media_file_name"]
 
     if data.get("media_is_photo"):
+        bio.name = "photo.jpg"
         await client.send_file(entity, bio, caption=caption[:1024], force_document=False)
-    else:
-        await client.send_file(
-            entity,
-            bio,
-            caption=caption[:1024],
-            attributes=data.get("media_attributes"),
-            mime_type=data.get("media_mime_type"),
-            force_document=False,
-        )
+        return
+
+    file_name = data.get("media_file_name")
+    mime = data.get("media_mime_type") or ""
+    if not file_name:
+        if mime.startswith("video/"):
+            file_name = "video.mp4"
+        elif mime.startswith("audio/"):
+            file_name = "audio.ogg"
+        elif mime.startswith("image/"):
+            ext = mime.split("/")[-1] or "jpg"
+            file_name = f"image.{ext}"
+    if file_name:
+        bio.name = file_name
+
+    await client.send_file(
+        entity,
+        bio,
+        caption=caption[:1024],
+        attributes=data.get("media_attributes"),
+        mime_type=mime or None,
+        force_document=False,
+    )
 
 
-async def _notify(client, data):
+async def _notify_to(client, dest, data):
+    """Core send: puts one cached message into `dest` (a group id or 'me')."""
     sender_label = "خودت" if data["out"] else await _resolve_label(client, data["sender_id"])
     date_label = (
         data["date"].astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
@@ -261,12 +281,22 @@ async def _notify(client, data):
 
     if data["media_bytes"]:
         caption = header + (f"\n\n{data['text']}" if data["text"] else "")
-        await _send_cached_media(client, "me", data, caption)
+        await _send_cached_media(client, dest, data, caption)
     elif data["media_too_large"]:
-        await client.send_message("me", header + "\n\n⚠️ رسانه بزرگ‌تر از حد مجاز بود.")
+        await client.send_message(dest, header + "\n\n⚠️ رسانه بزرگ‌تر از حد مجاز بود.")
     else:
         body = header + (f"\n\n{data['text']}" if data["text"] else "")
-        await client.send_message("me", body)
+        await client.send_message(dest, body)
+
+
+async def _notify(client, data):
+    contact_id = data["sender_id"] if not data["out"] else data["chat_id"]
+    contact_label = await _resolve_label(client, contact_id)
+    try:
+        dest = await group_inbox.get_persistent_inbox(client, contact_label)
+    except Exception:
+        dest = "me"
+    await _notify_to(client, dest, data)
 
 
 async def _notify_with_retry(client, data, msg_id):
@@ -288,7 +318,6 @@ async def _notify_with_retry(client, data, msg_id):
 
 
 async def _notify_edit(client, old_entry, new_text, new_date):
-    chat_label = await _resolve_label(client, old_entry["chat_id"])
     sender_label = "خودت" if old_entry["out"] else await _resolve_label(client, old_entry["sender_id"])
     date_label = (
         new_date.astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
@@ -298,18 +327,22 @@ async def _notify_edit(client, old_entry, new_text, new_date):
     old_text = old_entry.get("text") or "(بدون متن)"
     new_text_label = new_text or "(بدون متن)"
 
-    header = (
-        "✏️ **یه پیام تو PV ویرایش شد**\n"
-        f"👤 چت: {chat_label}\n"
-        f"✍️ فرستنده: {sender_label}\n"
-        f"🕒 زمان ویرایش: {date_label}"
+    body = (
+        f"✏️ {sender_label}\n🕒 {date_label}\n\n"
+        f"🔴 {old_text}\n🟢 {new_text_label}"
     )
-    body = header + f"\n\n🔴 قبل از ویرایش:\n{old_text}" + f"\n\n🟢 بعد از ویرایش:\n{new_text_label}"
+
+    contact_id = old_entry["sender_id"] if not old_entry["out"] else old_entry["chat_id"]
+    contact_label = await _resolve_label(client, contact_id)
+    try:
+        dest = await group_inbox.get_persistent_inbox(client, contact_label)
+    except Exception:
+        dest = "me"
 
     if old_entry.get("media_bytes"):
-        await _send_cached_media(client, "me", old_entry, body)
+        await _send_cached_media(client, dest, old_entry, body)
     else:
-        await client.send_message("me", body)
+        await client.send_message(dest, body)
 
 
 async def _notify_edit_with_retry(client, old_entry, new_text, new_date, msg_id):
@@ -336,15 +369,10 @@ async def _cache_in_background(event):
 
 
 async def _resend_full_conversation(client, chat_id, all_entries):
-    """Called when a full 2-sided PV deletion is detected (a batch
-    containing messages from BOTH sides can only mean "delete for
-    everyone" on the whole chat). This used to build a styled HTML chat
-    export and send it as a .html file — but Telegram's in-app HTML
-    viewer on mobile is unreliable (spins forever, never actually opens),
-    and the export didn't even include the real media, just a placeholder
-    note saying media existed. Just resending each cached message
-    natively — same plain sender+time format as a normal single delete —
-    opens correctly everywhere with no extra viewer involved."""
+    """Called when a full 2-sided PV deletion is detected. Creates a fresh
+    dedicated group for every occurrence (per-user request: each wipe gets
+    its own archive), then resends every cached message into it natively so
+    photos/videos open correctly on mobile with no extra viewer."""
     all_entries_sorted = sorted(
         all_entries,
         key=lambda item: item[1].get("date") or _dt.min.replace(tzinfo=None),
@@ -353,21 +381,27 @@ async def _resend_full_conversation(client, chat_id, all_entries):
     count = len(all_entries_sorted)
 
     try:
-        await client.send_message("me", f"🗑 مکالمه با {chat_label} دوطرفه حذف شد — {count} پیام:")
+        dest = await group_inbox.create_snapshot_group(client, chat_label)
+    except Exception as e:
+        log.error(f"Anti-delete: couldn't create snapshot group, falling back to Saved Messages: {e}")
+        dest = "me"
+
+    try:
+        await client.send_message(dest, f"🗑 دیلیت دوطرفه با {chat_label} — {count} پیام:")
     except Exception as e:
         log.error(f"Anti-delete: couldn't send conversation-deleted header: {e}")
 
     for _mid, data in all_entries_sorted:
         try:
-            await _notify(client, data)
+            await _notify_to(client, dest, data)
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds)
             try:
-                await _notify(client, data)
+                await _notify_to(client, dest, data)
             except Exception as e2:
-                log.error(f"Anti-delete: couldn't resend a message from deleted conversation: {e2}")
+                log.error(f"Anti-delete: couldn't resend message from deleted conversation: {e2}")
         except Exception as e:
-            log.error(f"Anti-delete: couldn't resend a message from deleted conversation: {e}")
+            log.error(f"Anti-delete: couldn't resend message from deleted conversation: {e}")
         await asyncio.sleep(NOTIFY_DELAY)
 
 
