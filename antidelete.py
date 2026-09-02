@@ -392,168 +392,13 @@ async def _cache_in_background(event):
         log.error(f"Anti-delete cache error: {e}")
 
 
-_MSGS_PER_PAGE = 25  # messages rendered per chat-screenshot image
-
-
-def _render_page(entries, my_name, other_name, page_label: str, tz: str) -> bytes:
-    """Render a batch of cache entries as a dark-theme chat-screenshot PNG.
-
-    Uses PIL (already a project dependency for quote.py) and arabic-reshaper/
-    bidi (same). Imported lazily so startup RAM isn't affected when this
-    feature is never triggered.
-
-    Returns raw PNG bytes ready to pass to client.send_file().
-    """
-    from PIL import Image, ImageDraw, ImageFont
-    import arabic_reshaper
-    from bidi.algorithm import get_display
-    import os
-
-    W            = 1080
-    MARGIN       = 26
-    BUBBLE_MAX_W = int(W * 0.73)
-    F_MSG        = 27
-    F_NAME       = 20
-    F_TIME       = 18
-    PAD          = 16
-    GAP          = 10
-
-    BG          = (13, 13, 13)
-    C_ME        = (22, 97, 57)
-    C_THEM      = (36, 36, 44)
-    C_TEXT      = (228, 228, 228)
-    C_NAME_ME   = (90, 200, 120)
-    C_NAME_THEM = (90, 150, 215)
-    C_TIME      = (115, 115, 125)
-    C_HEAD      = (80, 130, 200)
-    C_NOTE      = (140, 140, 150)
-
-    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font.ttf")
-    try:
-        fm = ImageFont.truetype(font_path, F_MSG)
-        fn = ImageFont.truetype(font_path, F_NAME)
-        ft = ImageFont.truetype(font_path, F_TIME)
-        fh = ImageFont.truetype(font_path, F_NAME)
-    except Exception:
-        fm = fn = ft = fh = ImageFont.load_default()
-
-    def _bidi(txt: str) -> str:
-        if not txt:
-            return ""
-        try:
-            return get_display(arabic_reshaper.reshape(txt))
-        except Exception:
-            return txt
-
-    def _wrap(txt: str, max_w: int, draw, f) -> list:
-        if not txt:
-            return []
-        lines, cur = [], ""
-        for word in txt.split():
-            probe = (cur + " " + word).strip()
-            if draw.textlength(probe, font=f) <= max_w:
-                cur = probe
-            else:
-                if cur:
-                    lines.append(cur)
-                cur = word
-        if cur:
-            lines.append(cur)
-        return lines or [""]
-
-    # ── measure all bubbles on a throw-away canvas ───────────────────────
-    dummy = Image.new("RGB", (W, 1))
-    d0    = ImageDraw.Draw(dummy)
-    rows  = []
-    total_h = MARGIN + 50
-
-    for _, data in entries:
-        text    = data.get("text") or ""
-        date_obj = data.get("date")
-        try:
-            ts = (date_obj.astimezone(ZoneInfo(tz)).strftime("%H:%M")
-                  if date_obj else "?")
-        except Exception:
-            ts = "?"
-
-        shaped = _bidi(text)
-        is_out = data["out"]
-        sender = my_name if is_out else other_name
-        lines  = _wrap(shaped, BUBBLE_MAX_W - 2 * PAD, d0, fm)
-
-        fwd_note = _bidi(f"↪ {data['fwd_from_name']}") if data.get("fwd_from_name") else ""
-        fwd_h    = (F_NAME + 4) if fwd_note else 0
-
-        if data.get("media_too_large"):
-            media_note = _bidi("📎 رسانه بزرگ‌تر از ۲۰MB")
-        elif data.get("media_bytes"):
-            mime = (data.get("media_mime_type") or "").lower()
-            is_vid = mime.startswith("video/") or any(
-                hasattr(a, "duration") for a in (data.get("media_attributes") or [])
-            )
-            media_note = _bidi("🎬 ویدیو — جداگانه ارسال شد") if is_vid else _bidi("📎 رسانه")
-        else:
-            media_note = ""
-        note_h = (F_MSG + 4) if media_note else 0
-
-        txt_h = len(lines) * (F_MSG + 4)
-        bh    = PAD + F_NAME + 4 + fwd_h + txt_h + note_h + 4 + F_TIME + PAD
-
-        rows.append(dict(is_out=is_out, sender=sender, lines=lines,
-                         ts=ts, bh=bh, fwd_note=fwd_note, media_note=media_note))
-        total_h += bh + GAP
-
-    total_h += MARGIN
-
-    # ── draw ─────────────────────────────────────────────────────────────
-    img  = Image.new("RGB", (W, total_h), BG)
-    draw = ImageDraw.Draw(img)
-
-    draw.text((W // 2, MARGIN + 10), _bidi(page_label),
-              fill=C_HEAD, font=fh, anchor="mm")
-
-    y = MARGIN + 50
-    for row in rows:
-        is_out = row["is_out"]
-        mw = max((draw.textlength(l, font=fm) for l in row["lines"]), default=60)
-        nw = draw.textlength(row["sender"], font=fn)
-        tw = draw.textlength(row["ts"],     font=ft)
-        bw = min(BUBBLE_MAX_W, int(max(mw, nw, tw)) + 2 * PAD)
-        x  = (W - MARGIN - bw) if is_out else MARGIN
-        draw.rounded_rectangle([x, y, x + bw, y + row["bh"]], radius=14,
-                                fill=(C_ME if is_out else C_THEM))
-
-        cy = y + PAD
-        draw.text((x + PAD, cy), row["sender"],
-                  fill=(C_NAME_ME if is_out else C_NAME_THEM), font=fn)
-        cy += F_NAME + 4
-
-        if row["fwd_note"]:
-            draw.text((x + PAD, cy), row["fwd_note"], fill=C_NOTE, font=ft)
-            cy += F_NAME + 4
-
-        for ln in row["lines"]:
-            draw.text((x + PAD, cy), ln, fill=C_TEXT, font=fm)
-            cy += F_MSG + 4
-
-        if row["media_note"]:
-            draw.text((x + PAD, cy), row["media_note"], fill=C_NOTE, font=ft)
-
-        draw.text((x + bw - PAD, y + row["bh"] - PAD - F_TIME),
-                  row["ts"], fill=C_TIME, font=ft, anchor="rt")
-
-        y += row["bh"] + GAP
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True, compress_level=6)
-    return buf.getvalue()
-
-
 async def _resend_full_conversation(client, chat_id, all_entries):
-    """Saves a bilateral-delete event as chat-screenshot PNG images sent to
-    a dedicated group. Images open natively in Telegram on every device
-    (no download, no browser, no external app). Videos are sent as native
-    video files in the same group so they play inline too."""
+    """Saves a bilateral-delete to ONE dedicated group, message by message.
+    Text messages are sent as plain Telegram messages; media (photos, videos,
+    files) are sent as native Telegram files — everything opens inline in
+    Telegram without any external app. One group, one run, exactly once per
+    bilateral-delete event (the debounce + cooldown in register() guarantees
+    this function is never called twice for the same event)."""
     all_sorted = sorted(
         all_entries,
         key=lambda item: item[1].get("date") or _dt.min.replace(tzinfo=None),
@@ -573,56 +418,68 @@ async def _resend_full_conversation(client, chat_id, all_entries):
         except Exception:
             dest = "me"
 
+    # ── Header ────────────────────────────────────────────────────────────
     await client.send_message(
         dest,
         f"🗑 **دیلیت دوطرفه با {chat_label}**\n"
-        f"📝 {count} پیام · {now_str}",
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 مخاطب: **{chat_label}**\n"
+        f"📝 تعداد پیام: **{count}**\n"
+        f"🕒 زمان: `{now_str}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━",
     )
     await asyncio.sleep(0.5)
 
-    # ── render conversation as chat-screenshot images ─────────────────────
-    pages       = [all_sorted[i:i + _MSGS_PER_PAGE]
-                   for i in range(0, len(all_sorted), _MSGS_PER_PAGE)]
-    total_pages = len(pages)
-
-    for pi, page in enumerate(pages, 1):
-        label = f"مکالمه با {chat_label}"
-        if total_pages > 1:
-            label += f" — صفحه {pi} از {total_pages}"
+    # ── Messages — one by one ─────────────────────────────────────────────
+    for _mid, data in all_sorted:
+        is_out   = data["out"]
+        date_obj = data.get("date")
         try:
-            png = await asyncio.to_thread(
-                _render_page, page, my_name, chat_label, label, CLOCK_TIMEZONE
-            )
-            buf      = io.BytesIO(png)
-            buf.name = f"chat_p{pi:02d}.png"
-            await client.send_file(dest, buf, force_document=False)
-            await asyncio.sleep(0.8)
-        except Exception as e:
-            log.error(f"Anti-delete: page {pi} render failed: {e}")
+            ts = (date_obj.astimezone(ZoneInfo(CLOCK_TIMEZONE)).strftime("%H:%M")
+                  if date_obj else "?")
+        except Exception:
+            ts = "?"
 
-    # ── send videos as native playable files ──────────────────────────────
-    for _, data in all_sorted:
-        mime     = (data.get("media_mime_type") or "").lower()
-        is_video = mime.startswith("video/") or any(
-            hasattr(a, "duration") for a in (data.get("media_attributes") or [])
-        )
-        if is_video and data.get("media_bytes"):
+        arrow  = "▶️" if is_out else "◀️"
+        sender = f"**{my_name}**" if is_out else f"**{chat_label}**"
+        prefix = f"{arrow} {sender} · _{ts}_"
+        fwd    = (f"\n↪️ _فوروارد از {data['fwd_from_name']}_"
+                  if data.get("fwd_from_name") else "")
+        text   = data.get("text") or ""
+
+        try:
+            if data.get("media_bytes"):
+                caption = f"{prefix}{fwd}"
+                if text:
+                    caption += f"\n{text}"
+                await _send_cached_media(client, dest, data, caption)
+            else:
+                body = f"{prefix}{fwd}"
+                if text:
+                    body += f"\n{text}"
+                elif data.get("media_too_large"):
+                    body += "\n📎 _رسانه — بزرگ‌تر از ۲۰MB بود_"
+                else:
+                    body += "\n_(بدون متن)_"
+                await client.send_message(dest, body)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
             try:
-                await _send_cached_media(client, dest, data, "")
-                await asyncio.sleep(NOTIFY_DELAY)
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds)
-                try:
-                    await _send_cached_media(client, dest, data, "")
-                except Exception as e2:
-                    log.error(f"Anti-delete: video resend failed: {e2}")
-            except Exception as e:
-                log.error(f"Anti-delete: video resend failed: {e}")
+                if data.get("media_bytes"):
+                    await _send_cached_media(client, dest, data, caption)
+                else:
+                    await client.send_message(dest, body)
+            except Exception as e2:
+                log.error(f"Anti-delete bilateral resend: {e2}")
+        except Exception as e:
+            log.error(f"Anti-delete bilateral resend: {e}")
 
-    log.ok(
-        f"Anti-delete: bilateral delete with {chat_label} saved "
-        f"({count} messages, {total_pages} screenshot images)"
-    )
+        await asyncio.sleep(NOTIFY_DELAY)
+
+    # ── Footer ────────────────────────────────────────────────────────────
+    await client.send_message(dest, f"━━━━━━━━━━━━━━━━━━━━\n🏁 **پایان مکالمه با {chat_label}**")
+
+    log.ok(f"Anti-delete: bilateral delete with {chat_label} saved ({count} messages)")
 
 
 def register(client):
