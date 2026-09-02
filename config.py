@@ -54,6 +54,14 @@ OPENROUTER_FALLBACK_MODELS = [
 # Client-side rate limit on OpenRouter calls. 0 = unlimited.
 OPENROUTER_MAX_CALLS_PER_MINUTE = _get("OPENROUTER_MAX_CALLS_PER_MINUTE", default=0, cast=int)
 
+# Comma-separated bot usernames whose messages antidelete should ignore
+# (neither cache nor report). Set this to your own control bot's username
+# and any other bots you don't want tracked.
+# Example: ANTIDELETE_EXCLUDE_BOTS=mycontrolbot,anotherbot
+ANTIDELETE_EXCLUDE_BOTS: set = {
+    u.strip() for u in _get("ANTIDELETE_EXCLUDE_BOTS", default="").split(",") if u.strip()
+}
+
 # Port Render assigns for the health-check web server (irrelevant when
 # running locally).
 PORT = _get("PORT", default=8080, cast=int)

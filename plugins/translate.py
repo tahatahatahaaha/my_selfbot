@@ -1,10 +1,13 @@
 """`.ترجمه` — translates a replied-to message, or text given directly,
 into the requested language. Uses deep-translator's free Google Translate
-wrapper (no API key needed)."""
+wrapper (no API key needed).
+
+GoogleTranslator is imported lazily (inside cmd_translate) so the ~5 MB
+requests/deep-translator dependency tree doesn't load at startup if
+translation is never used.
+"""
 
 import asyncio
-
-from deep_translator import GoogleTranslator
 
 # Common Persian/English names -> ISO language codes. Anything else typed
 # is tried as a raw code (e.g. "de", "ja") so this isn't a hard whitelist.
@@ -54,8 +57,7 @@ async def cmd_translate(event, lang_word: str, text: str = ""):
 
     await event.edit("🌐 …")
     try:
-        # deep_translator is a blocking/sync HTTP call — run off the event
-        # loop so it doesn't stall other outgoing-message handling meanwhile.
+        from deep_translator import GoogleTranslator  # lazy
         translated = await asyncio.to_thread(
             lambda: GoogleTranslator(source="auto", target=target).translate(text)
         )

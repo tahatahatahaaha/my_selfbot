@@ -1,102 +1,83 @@
 """
-group_inbox.py — persistent per-contact group inboxes for anti-delete/edit.
+group_inbox.py — group inboxes for anti-delete/edit.
 
-Instead of spamming Saved Messages (which becomes a mess fast), deleted
-and edited messages go into dedicated private groups, one per contact:
+TWO groups total, regardless of how many contacts you have:
 
-  "📥 حذف‌شده‌ها — <contact name>"   → single persistent group, for ongoing
-                                        one-sided deletes and edits from/to
-                                        this contact. Created once, reused.
+  "📥 حذف‌شده‌ها"
+      One persistent group for ALL one-sided deletes and edits, all
+      contacts mixed in. Created once on first use, reused forever.
 
-  "🗑 دیلیت دوطرفه — <contact name>" → NEW group every time the whole
-                                        conversation is wiped (both sides
-                                        deleted at once). Ephemeral snapshot.
+  "🗑 دیلیت دوطرفه — <contact name>  <timestamp>"
+      A fresh group created ONCE per bilateral-delete event. Because
+      Telegram fires multiple MessageDeleted batches for a single
+      "delete for everyone", the handler in antidelete.py debounces
+      them (waits a short window, collects all batches, then calls
+      create_bilateral_group exactly once per event).
 
-Groups are created as a "megagroup" (proper Telegram group, not a channel)
-with no other members — only the account owner is in them. That means they
-show up in the chat list like normal chats and all content opens natively
-(inline photos, streamable video, etc.) with no extra viewer involved.
-
-The mapping (contact display-name → group id) is persisted to a tiny JSON
-file ("group_inbox_map.json") next to the bot files, so the bot survives
-restarts without creating duplicate groups.
+Groups are megagroups (real Telegram groups) with no other members.
+The persistent-inbox id is stored in group_inbox_map.json so it
+survives restarts without creating duplicates.
 """
 
 import asyncio
 import json
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from telethon.errors import FloodWaitError
 from telethon.tl.functions.channels import CreateChannelRequest
-from telethon.tl.functions.messages import CreateChatRequest
 
+from config import CLOCK_TIMEZONE
 from logger import log
 
 _MAP_FILE = os.path.join(os.path.dirname(__file__), "group_inbox_map.json")
 _lock = asyncio.Lock()
-
-# In-memory map: display_name → telegram group/channel id (int)
-_inbox_map: dict[str, int] = {}
+_inbox_id: int | None = None
 _loaded = False
 
 
 def _load():
-    global _loaded, _inbox_map
+    global _loaded, _inbox_id
     if _loaded:
         return
     _loaded = True
     if os.path.exists(_MAP_FILE):
         try:
-            _inbox_map = json.loads(open(_MAP_FILE, encoding="utf-8").read())
+            data = json.loads(open(_MAP_FILE, encoding="utf-8").read())
+            _inbox_id = data.get("inbox_id")
         except Exception:
-            _inbox_map = {}
+            pass
 
 
 def _save():
     try:
         with open(_MAP_FILE, "w", encoding="utf-8") as f:
-            json.dump(_inbox_map, f, ensure_ascii=False)
+            json.dump({"inbox_id": _inbox_id}, f)
     except Exception as e:
         log.error(f"group_inbox: couldn't save map: {e}")
 
 
 async def _create_group(client, title: str) -> int:
-    """Creates a new private megagroup with the given title and returns
-    its numeric chat id. Only the account owner is a member."""
-    try:
-        # CreateChannel with megagroup=True is the most reliable way to
-        # create a group with no other members — CreateChatRequest requires
-        # at least one other user_id, which we'd then have to kick.
-        result = await client(CreateChannelRequest(
-            title=title,
-            about="",
-            megagroup=True,
-        ))
-        group_id = result.chats[0].id
-        log.ok(f"group_inbox: created group «{title}» (id={group_id})")
-        return group_id
-    except Exception as e:
-        log.error(f"group_inbox: couldn't create group «{title}»: {e}")
-        raise
+    result = await client(CreateChannelRequest(title=title, about="", megagroup=True))
+    gid = result.chats[0].id
+    log.ok(f"group_inbox: created «{title}» (id={gid})")
+    return gid
 
 
-async def get_persistent_inbox(client, contact_label: str) -> int:
-    """Returns the id of the one persistent delete/edit inbox group for
-    this contact, creating it the first time it's needed."""
+async def get_inbox(client) -> int:
+    """Returns the single persistent inbox group id, creating it if needed."""
+    global _inbox_id
     async with _lock:
         _load()
-        title = f"📥 حذف‌شده‌ها — {contact_label}"
-        key = f"persistent:{contact_label}"
-        if key in _inbox_map:
-            return _inbox_map[key]
-        gid = await _create_group(client, title)
-        _inbox_map[key] = gid
+        if _inbox_id is not None:
+            return _inbox_id
+        _inbox_id = await _create_group(client, "📥 حذف‌شده‌ها")
         _save()
-        return gid
+        return _inbox_id
 
 
-async def create_snapshot_group(client, contact_label: str) -> int:
-    """Creates a fresh snapshot group for a full 2-sided deletion event
-    (a new group every time — no reuse)."""
-    title = f"🗑 دیلیت دوطرفه — {contact_label}"
+async def create_bilateral_group(client, contact_label: str) -> int:
+    """Creates ONE fresh group for a bilateral-delete event."""
+    now = datetime.now(ZoneInfo(CLOCK_TIMEZONE)).strftime("%m/%d %H:%M")
+    title = f"🗑 {contact_label} — {now}"
     return await _create_group(client, title)

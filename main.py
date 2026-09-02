@@ -35,6 +35,8 @@ async def main():
     log.ok(f"Connected as: {me.first_name}")
     log.ok("SelfBot started")
 
+    antidelete.set_my_id(me.id)
+
     # استارت هم‌زمان کنترل‌بات
     try:
         await start_control_bot()

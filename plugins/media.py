@@ -1,21 +1,23 @@
-"""Media plugins: turning replied-to messages into quote cards / stickers."""
+"""Media plugins: turning replied-to messages into quote cards / stickers.
+
+Heavy libraries (PIL, arabic-reshaper, bidi, imageio-ffmpeg) are imported
+lazily — only when the command actually runs, not at startup. This keeps
+idle RAM ~25-35 MB lower than the eager-import version, since most sessions
+never call .quote or .اسکرین at all.
+"""
 
 import io
 
-import quote
-import quotlybot
-import stickers
 from logger import log
 from telegram_layer import client
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeSticker, InputStickerSetEmpty
 
-VIDEO_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50MB cap on full video/gif download for sticker conversion
+VIDEO_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024  # 50MB cap
 
-# All three static-sticker sends need BOTH of these or Telegram may not
-# recognize the file as an actual sticker — it'll deliver it as a plain
-# document instead, which desktop clients then hand off to the OS's default
-# .webp handler (often a browser, which is why it can look like a random
-# "HTML" file opening instead of showing as a sticker in-chat).
+# Both attributes are required for Telegram to treat the file as an actual
+# sticker rather than a plain document (otherwise desktop clients open it
+# via the OS default handler — typically a browser — instead of showing it
+# as an in-chat sticker).
 STATIC_STICKER_KWARGS = {"mime_type": "image/webp"}
 
 
@@ -41,6 +43,7 @@ async def cmd_quote(event):
     except Exception as e:
         log.warn(f"Could not download avatar for quote: {e}")
 
+    import quote  # lazy — PIL/arabic-reshaper/bidi only loaded on first .quote call
     image_bytes = quote.build_quote_image(
         sender_name, reply.raw_text or "", avatar_bytes,
         sender_id=reply.sender_id, sent_at=reply.date,
@@ -92,17 +95,15 @@ async def cmd_screen(event):
 
     is_photo = bool(reply.photo)
     is_video = bool(reply.video)
-    is_gif = bool(reply.gif)
-    is_text = not reply.media and bool((reply.raw_text or "").strip())
+    is_gif   = bool(reply.gif)
+    is_text  = not reply.media and bool((reply.raw_text or "").strip())
 
     if not (is_photo or is_video or is_gif or is_text):
         await event.edit("⚠️ این پیام نه متن قابل‌استفاده داره نه عکس/ویدیو/گیف — نمی‌تونم ازش استیکر بسازم.")
         return
 
     if is_text:
-        # Prefer QuotLyBot's rendering (it produces real Telegram quote
-        # cards, incl. reply-chains) — fall back to the local PIL renderer
-        # if it times out or errors, so the command still always works.
+        import quotlybot  # lazy
         card_bytes = await quotlybot.render_via_quotly(client, reply)
 
         if card_bytes is None:
@@ -119,6 +120,7 @@ async def cmd_screen(event):
                 log.warn(f"Could not download avatar for screen: {e}")
 
             try:
+                import quote  # lazy
                 card_bytes = quote.build_quote_image(
                     sender_name, reply.raw_text, avatar_bytes,
                     sender_id=reply.sender_id, sent_at=reply.date,
@@ -134,6 +136,7 @@ async def cmd_screen(event):
         try:
             buf = io.BytesIO()
             await reply.download_media(file=buf)
+            import quote  # lazy
             sticker_bytes = quote.image_to_sticker(buf.getvalue())
         except Exception as e:
             await event.edit(f"⚠️ خطا تو ساخت استیکر: {e}")
@@ -142,8 +145,8 @@ async def cmd_screen(event):
         await _send_static_sticker(event, sticker_bytes, alt="🖼")
         return
 
-    # Video or GIF: try a real animated sticker first (same ffmpeg pipeline
-    # handles both — a Telegram "gif" is just a silent short mp4 already).
+    # Video or GIF
+    import stickers  # lazy — imageio-ffmpeg only needed for video stickers
     if stickers.is_available():
         try:
             size = reply.file.size if reply.file else None
@@ -177,10 +180,10 @@ async def cmd_screen(event):
         if result is None or buf.getbuffer().nbytes == 0:
             await event.edit("⚠️ نه ffmpeg در دسترس بود نه thumbnail قابل‌استفاده — نتونستم استیکر بسازم.")
             return
+        import quote  # lazy
         sticker_bytes = quote.image_to_sticker(buf.getvalue())
     except Exception as e:
         await event.edit(f"⚠️ خطا تو ساخت استیکر: {e}")
         return
 
     await _send_static_sticker(event, sticker_bytes, alt="🖼")
-

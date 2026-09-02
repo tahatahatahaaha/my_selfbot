@@ -29,7 +29,7 @@ notifying for it so Saved Messages isn't spammed with false "edits".
 
 import asyncio
 import io
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime as _dt
 from zoneinfo import ZoneInfo
 
@@ -49,8 +49,20 @@ NOTIFY_DELAY = 1.0  # seconds between forwarded notifications — a bulk
 NOTIFY_MAX_RETRIES = 3
 
 _chat_caches = {}       # chat_id -> {msg_id: entry}
-_chat_cache_order = {}  # chat_id -> [msg_id, ...] oldest -> newest
+_chat_cache_order = {}  # chat_id -> deque([msg_id, ...]) oldest-left
 _msg_index = {}         # msg_id -> chat_id, to route delete-event lookups
+
+# Own user id — set via set_my_id() right after client.get_me() in main.py.
+# Used to skip Saved Messages (the "chat with yourself") entirely: its
+# chat_id equals the account's own numeric id, so a single compare is all
+# that's needed. Also used in the delete handler to silently drop entries
+# that originated from Saved Messages.
+_my_id: int | None = None
+
+
+def set_my_id(uid: int):
+    global _my_id
+    _my_id = uid
 
 # Tracks (chat_id, msg_id) for messages that WERE a `.command` you sent
 # yourself. Those get edited in place by our own handlers (a `.حذف همه`
@@ -78,8 +90,10 @@ _control_bot_id = None          # resolved lazily, see _resolve_control_bot_id
 _control_bot_id_attempted = False
 
 # Extra bots whose messages should never be cached or reported.
-# Resolved lazily by username on first private message received.
-_EXTRA_EXCLUDE_USERNAMES = {"TMKselfbot"}
+# Set via ANTIDELETE_EXCLUDE_BOTS env var (comma-separated usernames),
+# e.g. ANTIDELETE_EXCLUDE_BOTS=mybotname,anotherbot
+# Nothing is hardcoded here — this file must not contain personal info.
+from config import ANTIDELETE_EXCLUDE_BOTS as _EXTRA_EXCLUDE_USERNAMES
 _excluded_bot_ids: set = set()
 _excluded_resolved = False
 
@@ -126,20 +140,33 @@ async def _resolve_excluded_bots(client):
 
 
 def _remember(chat_id, msg_id, entry):
-    cache = _chat_caches.setdefault(chat_id, {})
-    order = _chat_cache_order.setdefault(chat_id, [])
+    """Add or update a cache entry.
 
-    if msg_id in cache:
-        order.remove(msg_id)
+    Uses a deque for the per-chat insertion order so eviction is O(1)
+    (deque.popleft()) instead of O(n) (list.pop(0)).  Re-caching an
+    already-present message (edit case) only updates the dict value and
+    does NOT move the entry to the end of the deque — FIFO eviction is
+    perfectly correct here and avoids the O(n) deque.remove() call that
+    the old LRU-style code needed on every edit event.
+    """
+    cache = _chat_caches.setdefault(chat_id, {})
+    order = _chat_cache_order.setdefault(chat_id, deque())
+
+    is_new = msg_id not in cache
     cache[msg_id] = entry
-    order.append(msg_id)
     _msg_index[msg_id] = chat_id
 
-    while len(order) > CACHE_LIMIT_PER_CHAT:
-        oldest = order.pop(0)
-        cache.pop(oldest, None)
-        if _msg_index.get(oldest) == chat_id:
-            _msg_index.pop(oldest, None)
+    if is_new:
+        order.append(msg_id)
+        # Evict oldest entries to stay within the per-chat cap.  Skip any
+        # "ghost" ids that _pop() left behind (they're no longer in cache).
+        while len(order) > CACHE_LIMIT_PER_CHAT:
+            oldest = order.popleft()          # O(1) with deque
+            if oldest not in cache:
+                continue                       # ghost — already deleted, skip
+            cache.pop(oldest, None)
+            if _msg_index.get(oldest) == chat_id:
+                _msg_index.pop(oldest, None)
 
 
 def _pop(msg_id):
@@ -147,10 +174,11 @@ def _pop(msg_id):
     if chat_id is None:
         return None
     cache = _chat_caches.get(chat_id)
-    order = _chat_cache_order.get(chat_id)
     data = cache.pop(msg_id, None) if cache else None
-    if order and msg_id in order:
-        order.remove(msg_id)
+    # Leave the deque entry as a "ghost" — it'll be skipped during the next
+    # eviction pass in _remember (which checks cache membership). This avoids
+    # an O(n) deque.remove() on every deleted message; ghosts are harmless
+    # because they never outnumber the CACHE_LIMIT_PER_CHAT live entries.
     return data
 
 
@@ -290,10 +318,8 @@ async def _notify_to(client, dest, data):
 
 
 async def _notify(client, data):
-    contact_id = data["sender_id"] if not data["out"] else data["chat_id"]
-    contact_label = await _resolve_label(client, contact_id)
     try:
-        dest = await group_inbox.get_persistent_inbox(client, contact_label)
+        dest = await group_inbox.get_inbox(client)
     except Exception:
         dest = "me"
     await _notify_to(client, dest, data)
@@ -332,10 +358,8 @@ async def _notify_edit(client, old_entry, new_text, new_date):
         f"🔴 {old_text}\n🟢 {new_text_label}"
     )
 
-    contact_id = old_entry["sender_id"] if not old_entry["out"] else old_entry["chat_id"]
-    contact_label = await _resolve_label(client, contact_id)
     try:
-        dest = await group_inbox.get_persistent_inbox(client, contact_label)
+        dest = await group_inbox.get_inbox(client)
     except Exception:
         dest = "me"
 
@@ -368,49 +392,250 @@ async def _cache_in_background(event):
         log.error(f"Anti-delete cache error: {e}")
 
 
+_MSGS_PER_PAGE = 25  # messages rendered per chat-screenshot image
+
+
+def _render_page(entries, my_name, other_name, page_label: str, tz: str) -> bytes:
+    """Render a batch of cache entries as a dark-theme chat-screenshot PNG.
+
+    Uses PIL (already a project dependency for quote.py) and arabic-reshaper/
+    bidi (same). Imported lazily so startup RAM isn't affected when this
+    feature is never triggered.
+
+    Returns raw PNG bytes ready to pass to client.send_file().
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    import os
+
+    W            = 1080
+    MARGIN       = 26
+    BUBBLE_MAX_W = int(W * 0.73)
+    F_MSG        = 27
+    F_NAME       = 20
+    F_TIME       = 18
+    PAD          = 16
+    GAP          = 10
+
+    BG          = (13, 13, 13)
+    C_ME        = (22, 97, 57)
+    C_THEM      = (36, 36, 44)
+    C_TEXT      = (228, 228, 228)
+    C_NAME_ME   = (90, 200, 120)
+    C_NAME_THEM = (90, 150, 215)
+    C_TIME      = (115, 115, 125)
+    C_HEAD      = (80, 130, 200)
+    C_NOTE      = (140, 140, 150)
+
+    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font.ttf")
+    try:
+        fm = ImageFont.truetype(font_path, F_MSG)
+        fn = ImageFont.truetype(font_path, F_NAME)
+        ft = ImageFont.truetype(font_path, F_TIME)
+        fh = ImageFont.truetype(font_path, F_NAME)
+    except Exception:
+        fm = fn = ft = fh = ImageFont.load_default()
+
+    def _bidi(txt: str) -> str:
+        if not txt:
+            return ""
+        try:
+            return get_display(arabic_reshaper.reshape(txt))
+        except Exception:
+            return txt
+
+    def _wrap(txt: str, max_w: int, draw, f) -> list:
+        if not txt:
+            return []
+        lines, cur = [], ""
+        for word in txt.split():
+            probe = (cur + " " + word).strip()
+            if draw.textlength(probe, font=f) <= max_w:
+                cur = probe
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = word
+        if cur:
+            lines.append(cur)
+        return lines or [""]
+
+    # ── measure all bubbles on a throw-away canvas ───────────────────────
+    dummy = Image.new("RGB", (W, 1))
+    d0    = ImageDraw.Draw(dummy)
+    rows  = []
+    total_h = MARGIN + 50
+
+    for _, data in entries:
+        text    = data.get("text") or ""
+        date_obj = data.get("date")
+        try:
+            ts = (date_obj.astimezone(ZoneInfo(tz)).strftime("%H:%M")
+                  if date_obj else "?")
+        except Exception:
+            ts = "?"
+
+        shaped = _bidi(text)
+        is_out = data["out"]
+        sender = my_name if is_out else other_name
+        lines  = _wrap(shaped, BUBBLE_MAX_W - 2 * PAD, d0, fm)
+
+        fwd_note = _bidi(f"↪ {data['fwd_from_name']}") if data.get("fwd_from_name") else ""
+        fwd_h    = (F_NAME + 4) if fwd_note else 0
+
+        if data.get("media_too_large"):
+            media_note = _bidi("📎 رسانه بزرگ‌تر از ۲۰MB")
+        elif data.get("media_bytes"):
+            mime = (data.get("media_mime_type") or "").lower()
+            is_vid = mime.startswith("video/") or any(
+                hasattr(a, "duration") for a in (data.get("media_attributes") or [])
+            )
+            media_note = _bidi("🎬 ویدیو — جداگانه ارسال شد") if is_vid else _bidi("📎 رسانه")
+        else:
+            media_note = ""
+        note_h = (F_MSG + 4) if media_note else 0
+
+        txt_h = len(lines) * (F_MSG + 4)
+        bh    = PAD + F_NAME + 4 + fwd_h + txt_h + note_h + 4 + F_TIME + PAD
+
+        rows.append(dict(is_out=is_out, sender=sender, lines=lines,
+                         ts=ts, bh=bh, fwd_note=fwd_note, media_note=media_note))
+        total_h += bh + GAP
+
+    total_h += MARGIN
+
+    # ── draw ─────────────────────────────────────────────────────────────
+    img  = Image.new("RGB", (W, total_h), BG)
+    draw = ImageDraw.Draw(img)
+
+    draw.text((W // 2, MARGIN + 10), _bidi(page_label),
+              fill=C_HEAD, font=fh, anchor="mm")
+
+    y = MARGIN + 50
+    for row in rows:
+        is_out = row["is_out"]
+        mw = max((draw.textlength(l, font=fm) for l in row["lines"]), default=60)
+        nw = draw.textlength(row["sender"], font=fn)
+        tw = draw.textlength(row["ts"],     font=ft)
+        bw = min(BUBBLE_MAX_W, int(max(mw, nw, tw)) + 2 * PAD)
+        x  = (W - MARGIN - bw) if is_out else MARGIN
+        draw.rounded_rectangle([x, y, x + bw, y + row["bh"]], radius=14,
+                                fill=(C_ME if is_out else C_THEM))
+
+        cy = y + PAD
+        draw.text((x + PAD, cy), row["sender"],
+                  fill=(C_NAME_ME if is_out else C_NAME_THEM), font=fn)
+        cy += F_NAME + 4
+
+        if row["fwd_note"]:
+            draw.text((x + PAD, cy), row["fwd_note"], fill=C_NOTE, font=ft)
+            cy += F_NAME + 4
+
+        for ln in row["lines"]:
+            draw.text((x + PAD, cy), ln, fill=C_TEXT, font=fm)
+            cy += F_MSG + 4
+
+        if row["media_note"]:
+            draw.text((x + PAD, cy), row["media_note"], fill=C_NOTE, font=ft)
+
+        draw.text((x + bw - PAD, y + row["bh"] - PAD - F_TIME),
+                  row["ts"], fill=C_TIME, font=ft, anchor="rt")
+
+        y += row["bh"] + GAP
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True, compress_level=6)
+    return buf.getvalue()
+
+
 async def _resend_full_conversation(client, chat_id, all_entries):
-    """Called when a full 2-sided PV deletion is detected. Creates a fresh
-    dedicated group for every occurrence (per-user request: each wipe gets
-    its own archive), then resends every cached message into it natively so
-    photos/videos open correctly on mobile with no extra viewer."""
-    all_entries_sorted = sorted(
+    """Saves a bilateral-delete event as chat-screenshot PNG images sent to
+    a dedicated group. Images open natively in Telegram on every device
+    (no download, no browser, no external app). Videos are sent as native
+    video files in the same group so they play inline too."""
+    all_sorted = sorted(
         all_entries,
         key=lambda item: item[1].get("date") or _dt.min.replace(tzinfo=None),
     )
     chat_label = await _resolve_label(client, chat_id)
-    count = len(all_entries_sorted)
+    me_entity  = await client.get_me()
+    my_name    = getattr(me_entity, "first_name", None) or "من"
+    now_str    = _dt.now(ZoneInfo(CLOCK_TIMEZONE)).strftime("%Y-%m-%d %H:%M")
+    count      = len(all_sorted)
 
     try:
-        dest = await group_inbox.create_snapshot_group(client, chat_label)
+        dest = await group_inbox.create_bilateral_group(client, chat_label)
     except Exception as e:
-        log.error(f"Anti-delete: couldn't create snapshot group, falling back to Saved Messages: {e}")
-        dest = "me"
-
-    try:
-        await client.send_message(dest, f"🗑 دیلیت دوطرفه با {chat_label} — {count} پیام:")
-    except Exception as e:
-        log.error(f"Anti-delete: couldn't send conversation-deleted header: {e}")
-
-    for _mid, data in all_entries_sorted:
+        log.error(f"Anti-delete: couldn't create bilateral group: {e}")
         try:
-            await _notify_to(client, dest, data)
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds)
-            try:
-                await _notify_to(client, dest, data)
-            except Exception as e2:
-                log.error(f"Anti-delete: couldn't resend message from deleted conversation: {e2}")
+            dest = await group_inbox.get_inbox(client)
+        except Exception:
+            dest = "me"
+
+    await client.send_message(
+        dest,
+        f"🗑 **دیلیت دوطرفه با {chat_label}**\n"
+        f"📝 {count} پیام · {now_str}",
+    )
+    await asyncio.sleep(0.5)
+
+    # ── render conversation as chat-screenshot images ─────────────────────
+    pages       = [all_sorted[i:i + _MSGS_PER_PAGE]
+                   for i in range(0, len(all_sorted), _MSGS_PER_PAGE)]
+    total_pages = len(pages)
+
+    for pi, page in enumerate(pages, 1):
+        label = f"مکالمه با {chat_label}"
+        if total_pages > 1:
+            label += f" — صفحه {pi} از {total_pages}"
+        try:
+            png = await asyncio.to_thread(
+                _render_page, page, my_name, chat_label, label, CLOCK_TIMEZONE
+            )
+            buf      = io.BytesIO(png)
+            buf.name = f"chat_p{pi:02d}.png"
+            await client.send_file(dest, buf, force_document=False)
+            await asyncio.sleep(0.8)
         except Exception as e:
-            log.error(f"Anti-delete: couldn't resend message from deleted conversation: {e}")
-        await asyncio.sleep(NOTIFY_DELAY)
+            log.error(f"Anti-delete: page {pi} render failed: {e}")
+
+    # ── send videos as native playable files ──────────────────────────────
+    for _, data in all_sorted:
+        mime     = (data.get("media_mime_type") or "").lower()
+        is_video = mime.startswith("video/") or any(
+            hasattr(a, "duration") for a in (data.get("media_attributes") or [])
+        )
+        if is_video and data.get("media_bytes"):
+            try:
+                await _send_cached_media(client, dest, data, "")
+                await asyncio.sleep(NOTIFY_DELAY)
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds)
+                try:
+                    await _send_cached_media(client, dest, data, "")
+                except Exception as e2:
+                    log.error(f"Anti-delete: video resend failed: {e2}")
+            except Exception as e:
+                log.error(f"Anti-delete: video resend failed: {e}")
+
+    log.ok(
+        f"Anti-delete: bilateral delete with {chat_label} saved "
+        f"({count} messages, {total_pages} screenshot images)"
+    )
 
 
 def register(client):
-    """Call once with the running TelegramClient to enable anti-delete."""
+    """Call once with the running TelegramClient to enable anti-delete.
+    Call set_my_id(me.id) after login so Saved Messages is excluded."""
 
     @client.on(events.NewMessage())
     async def _cache_handler(event):
         if not event.is_private:
+            return
+        # Skip Saved Messages (chat_id == own user id) — deleting there is
+        # deliberate housekeeping, not something worth saving.
+        if _my_id is not None and event.chat_id == _my_id:
             return
         if event.message.out and (event.message.raw_text or "").startswith(PREFIX):
             # This is you sending a `.command` — the selfbot is about to
@@ -445,6 +670,8 @@ def register(client):
     @client.on(events.MessageEdited())
     async def _edit_handler(event):
         if not event.is_private:
+            return
+        if _my_id is not None and event.chat_id == _my_id:
             return
         chat_id = event.chat_id
         msg_id = event.message.id
@@ -496,12 +723,32 @@ def register(client):
         # original one.
         asyncio.create_task(_cache_in_background(event))
 
+    # Debounce state for bilateral deletes: Telegram fires multiple
+    # MessageDeleted batches for a single "delete for everyone" — sometimes
+    # spread over 10+ seconds for large chats — so we accumulate all batches
+    # in a window and call _resend_full_conversation exactly once per event.
+    _bilateral_pending:   dict = {}  # chat_id -> {msg_id: data}
+    _bilateral_tasks:     dict = {}  # chat_id -> asyncio.Task
+    _bilateral_processed: dict = {}  # chat_id -> loop.time() of last processing
+    BILATERAL_DEBOUNCE_SECS = 10.0   # was 3 s — Telegram can spread batches over 10 s+
+    BILATERAL_COOLDOWN_SECS = 90.0   # ignore late batches for 90 s after processing
+
+    async def _flush_bilateral(chat_id):
+        await asyncio.sleep(BILATERAL_DEBOUNCE_SECS)
+        entries = list(_bilateral_pending.pop(chat_id, {}).items())
+        _bilateral_tasks.pop(chat_id, None)
+        if entries:
+            # Stamp BEFORE launching the task so any late-arriving batches
+            # that slip in while rendering is still in progress are blocked
+            # by the cooldown check in _delete_handler.
+            _bilateral_processed[chat_id] = asyncio.get_event_loop().time()
+            asyncio.create_task(_resend_full_conversation(client, chat_id, entries))
+
     @client.on(events.MessageDeleted())
     async def _delete_handler(event):
         if not event.deleted_ids:
             return
 
-        # Pop every deleted id from the cache.
         hits = []
         for msg_id in event.deleted_ids:
             data = _pop(msg_id)
@@ -511,30 +758,48 @@ def register(client):
         if not hits:
             return
 
+        # Skip anything from Saved Messages or from the control bot.
+        if _my_id is not None:
+            hits = [(mid, d) for mid, d in hits if d["chat_id"] != _my_id]
+        if _control_bot_id is not None:
+            hits = [(mid, d) for mid, d in hits if d.get("sender_id") != _control_bot_id]
+
+        if not hits:
+            return
+
         own_hits   = [(mid, d) for mid, d in hits if     d["out"]]
         other_hits = [(mid, d) for mid, d in hits if not d["out"]]
 
         # ── Full 2-sided PV deletion ──────────────────────────────────────
-        # The only way a single delete-event batch can contain messages from
-        # BOTH sides is a "delete for everyone" on the whole chat. In that
-        # case we save the entire cached conversation to a .txt file instead
-        # of sending individual Saved-Messages notifications.
+        # Accumulate batches in a debounce window; the flush task creates
+        # exactly ONE group after the window closes.
         if own_hits and other_hits:
             chat_id = hits[0][1]["chat_id"]
-            # Grab any remaining messages still in the cache for this chat
-            # (the batch may not cover all 500 cached entries — pull the rest).
-            remaining = list(_chat_caches.get(chat_id, {}).items())
-            all_entries = hits + remaining
-            asyncio.create_task(_resend_full_conversation(client, chat_id, all_entries))
+
+            # If we already processed a bilateral delete for this chat
+            # recently, this is just a late-arriving batch from the same
+            # event — skip it entirely so no second group gets created.
+            now  = asyncio.get_event_loop().time()
+            last = _bilateral_processed.get(chat_id, 0.0)
+            if now - last < BILATERAL_COOLDOWN_SECS:
+                return
+
+            bucket = _bilateral_pending.setdefault(chat_id, {})
+            for mid, d in hits:
+                bucket[mid] = d
+            # Also grab any remaining cached messages for this chat
+            for mid, d in _chat_caches.get(chat_id, {}).items():
+                bucket.setdefault(mid, d)
+            # (Re)start the debounce timer — cancels the previous one so
+            # a new batch resets the 10 s countdown from scratch.
+            if chat_id in _bilateral_tasks:
+                _bilateral_tasks[chat_id].cancel()
+            _bilateral_tasks[chat_id] = asyncio.create_task(_flush_bilateral(chat_id))
             return
 
-        # ── User deleted their own message ────────────────────────────────
-        # You consciously chose to delete it — nothing to report.
         if own_hits and not other_hits:
-            return
+            return  # You deleted your own message — nothing to report.
 
-        # ── Other person deleted their message ────────────────────────────
-        # Report each one to Saved Messages, with the usual flood-wait guard.
         for msg_id, data in other_hits:
             await _notify_with_retry(client, data, msg_id)
             await asyncio.sleep(NOTIFY_DELAY)
