@@ -64,6 +64,13 @@ async def cmd_download_video(event):
             reply_to=reply.id,
         )
         await event.delete()
+        try:
+            await reply.delete()
+        except Exception as e:
+            # Not fatal — the video already sent successfully. This just
+            # means we couldn't remove the original link (e.g. it's someone
+            # else's message in a group and this account isn't admin there).
+            log.warn(f"Downloader: couldn't delete original link message: {e}")
     except Exception as e:
         log.error(f"Downloader send error: {e}")
         await event.edit(f"❌ خطا در ارسال: {str(e)[:200]}")
