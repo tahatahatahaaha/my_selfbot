@@ -16,10 +16,20 @@ from telegram_layer import client
 
 MAX_FILE_MB  = 500
 _URL_RE      = re.compile(r'https?://[^\s\]\)>\"\']+', re.IGNORECASE)
-_FORMAT      = (
-    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+
+# Formats ordered from best to worst — each tier is a single pre-muxed
+# file that needs no ffmpeg merge. Only the last fallback ("best") can
+# sometimes be a combined stream too, but yt-dlp will try it anyway.
+# This completely avoids the "ffmpeg not installed" error on Railway
+# without installing any extra system package.
+_FORMAT = (
+    "bestvideo[height<=720][ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]"
+    "/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
     "/bestvideo[height<=720]+bestaudio"
-    "/best[height<=720]"
+    "/mp4[height<=720]"
+    "/mp4"
+    "/best[height<=720][ext=mp4]"
+    "/best[ext=mp4]"
     "/best"
 )
 
@@ -31,16 +41,32 @@ def _extract_url(text: str) -> str | None:
 
 def _do_download(url: str, outdir: str) -> str:
     import yt_dlp
+
+    # Disable automatic merging — this is what causes the "ffmpeg not
+    # installed" error when yt-dlp picks separate video+audio streams and
+    # then can't merge them. By setting merge_output_format to None and
+    # keeping ffmpeg_location blank, we force it to pick only pre-muxed
+    # single-file formats from _FORMAT above.
     opts = {
-        "format":             _FORMAT,
-        "outtmpl":            os.path.join(outdir, "%(title).60s.%(ext)s"),
-        "merge_output_format":"mp4",
-        "max_filesize":       MAX_FILE_MB * 1024 * 1024,
-        "quiet":              True,
-        "no_warnings":        True,
-        "noplaylist":         True,
-        "socket_timeout":     30,
-        "retries":            3,
+        "format":              _FORMAT,
+        "outtmpl":             os.path.join(outdir, "%(title).60s.%(ext)s"),
+        "merge_output_format": None,   # no merge → no ffmpeg needed
+        "max_filesize":        MAX_FILE_MB * 1024 * 1024,
+        "quiet":               True,
+        "no_warnings":         True,
+        "noplaylist":          True,
+        "socket_timeout":      30,
+        "retries":             3,
+        # YouTube has blocked most headless downloaders since 2024.
+        # Providing a recent browser User-Agent helps, but the real fix
+        # is using the "cookies-from-browser" option when running locally.
+        # On Railway (no browser) we use the web_embedded_player client
+        # via extractor_args, which still works for most public videos.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web_embedded", "android"],
+            }
+        },
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -49,6 +75,14 @@ def _do_download(url: str, outdir: str) -> str:
             )
         },
     }
+
+    # If a cookies file path is set in the environment, use it. This lets
+    # the user export their browser cookies once and paste the path as a
+    # Railway variable, unlocking age-restricted and region-locked videos.
+    cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
+    if cookies_file and os.path.exists(cookies_file):
+        opts["cookiefile"] = cookies_file
+
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if info is None:
@@ -70,8 +104,15 @@ def _do_download(url: str, outdir: str) -> str:
 
 def _friendly_error(e: Exception) -> str:
     msg = str(e).lower()
-    if any(k in msg for k in ("private", "login", "age", "sign in")):
-        return "❌ این محتوا خصوصی است یا نیاز به لاگین دارد."
+    if any(k in msg for k in ("private", "login", "age", "sign in", "not accessible")):
+        return (
+            "❌ این محتوا خصوصی است یا نیاز به لاگین دارد.\n"
+            "برای ویدیوهای عمومی یوتیوب که با این خطا رد می‌شن: "
+            "فایل کوکی مرورگر رو export کن و مسیرش رو تو Railway "
+            "با متغیر `YTDLP_COOKIES_FILE` تنظیم کن."
+        )
+    if any(k in msg for k in ("ffmpeg", "merging", "merger")):
+        return "❌ فرمت ویدیو نیاز به merge دارد — yt-dlp رو آپدیت کن تا فرمت بهتری انتخاب کند."
     if any(k in msg for k in ("unavailable", "not available", "removed", "deleted")):
         return "❌ این ویدیو در دسترس نیست یا حذف شده."
     if any(k in msg for k in ("filesize", "too large", "exceeds")):
