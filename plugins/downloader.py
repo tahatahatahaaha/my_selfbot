@@ -1,0 +1,144 @@
+"""
+Video downloader plugin — reply to any message containing a link and send `..`
+
+Supports: YouTube · Instagram · TikTok · Pinterest (and 1000+ other
+sites via yt-dlp under the hood).
+
+yt-dlp is imported lazily so it doesn't add to startup RAM unless this
+command is actually used.
+"""
+
+import asyncio
+import os
+import re
+import tempfile
+
+from logger import log
+from telegram_layer import client
+
+# Maximum file Telegram userbot can upload (capped below the hard 2 GB limit
+# to leave headroom and protect Railway's ephemeral disk).
+MAX_FILE_MB = 500
+
+# Any URL — yt-dlp supports far more platforms than the named ones.
+_URL_RE = re.compile(r'https?://[^\s\]\)>\"\']+', re.IGNORECASE)
+
+# Format string: prefer 720p MP4 so files stay reasonable; falls back
+# through progressively looser constraints until yt-dlp finds something.
+_FORMAT = (
+    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+    "/bestvideo[height<=720]+bestaudio"
+    "/best[height<=720]"
+    "/best"
+)
+
+
+def _extract_url(text: str) -> str | None:
+    m = _URL_RE.search(text or "")
+    return m.group(0).rstrip(".,)") if m else None
+
+
+def _do_download(url: str, outdir: str) -> str:
+    """Blocking download — must be called via asyncio.to_thread()."""
+    import yt_dlp                           # lazy — only loads on first use
+
+    opts = {
+        "format":                 _FORMAT,
+        "outtmpl":                os.path.join(outdir, "%(title).60s.%(ext)s"),
+        "merge_output_format":    "mp4",
+        "max_filesize":           MAX_FILE_MB * 1024 * 1024,
+        "quiet":                  True,
+        "no_warnings":            True,
+        "noplaylist":             True,      # single video only
+        "socket_timeout":         30,
+        "retries":                3,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+        },
+    }
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info is None:
+            raise RuntimeError("yt-dlp بازگشتی نداشت")
+        path = ydl.prepare_filename(info)
+
+    # yt-dlp sometimes writes .webm or changes extension after merging
+    if not os.path.exists(path):
+        base = os.path.splitext(path)[0]
+        for ext in ("mp4", "webm", "mkv", "mov"):
+            candidate = f"{base}.{ext}"
+            if os.path.exists(candidate):
+                return candidate
+        # last resort: find whatever file appeared in the temp dir
+        files = [os.path.join(outdir, f) for f in os.listdir(outdir)]
+        if files:
+            return max(files, key=os.path.getsize)
+        raise FileNotFoundError("فایل دانلود‌شده پیدا نشد")
+
+    return path
+
+
+def _friendly_error(e: Exception) -> str:
+    msg = str(e).lower()
+    if any(k in msg for k in ("private", "login", "age", "sign in")):
+        return "❌ این محتوا خصوصی است یا نیاز به لاگین دارد."
+    if any(k in msg for k in ("unavailable", "not available", "removed", "deleted")):
+        return "❌ این ویدیو در دسترس نیست یا حذف شده."
+    if any(k in msg for k in ("filesize", "too large", "exceeds")):
+        return f"❌ فایل بزرگ‌تر از {MAX_FILE_MB} MB است."
+    if any(k in msg for k in ("unsupported", "no video")):
+        return "❌ این لینک پشتیبانی نمی‌شود یا ویدیویی ندارد."
+    if any(k in msg for k in ("network", "timeout", "connect")):
+        return "❌ خطای شبکه — چند ثانیه صبر کن و دوباره امتحان کن."
+    return f"❌ خطا: {str(e)[:180]}"
+
+
+async def cmd_download_video(event):
+    """Triggered by `..` while replying to a message with a video link."""
+    if not event.is_reply:
+        await event.edit(
+            "⬇️ **دانلود ویدیو**\n"
+            "روی پیامی که لینک ویدیو داره ریپلای کن و `..` بزن.\n"
+            "یوتیوب · اینستاگرام · تیک‌تاک · پینترست پشتیبانی می‌شن."
+        )
+        return
+
+    reply = await event.get_reply_message()
+    if reply is None:
+        await event.edit("⚠️ پیام ریپلای پیدا نشد.")
+        return
+
+    url = _extract_url(reply.raw_text or "")
+    if not url:
+        await event.edit("⚠️ لینکی تو پیام پیدا نشد.")
+        return
+
+    await event.edit("⬇️ در حال دانلود…")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            path = await asyncio.to_thread(_do_download, url, tmpdir)
+        except Exception as e:
+            await event.edit(_friendly_error(e))
+            log.warn(f"Downloader: {e}")
+            return
+
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        await event.edit(f"📤 در حال ارسال… ({size_mb:.1f} MB)")
+
+        try:
+            await client.send_file(
+                event.chat_id,
+                path,
+                supports_streaming=True,
+                reply_to=reply.id,          # reply to the original link message
+            )
+            await event.delete()
+        except Exception as e:
+            await event.edit(f"❌ خطا در ارسال: {str(e)[:200]}")
+            log.error(f"Downloader send error: {e}")

@@ -11,15 +11,18 @@ from telethon.errors import FloodWaitError
 
 from help_text import HELP_TEXT
 from logger import log
-from plugins import ai_chat, core, media, moderation, panel, social, translate
+from plugins import ai_chat, core, downloader, media, moderation, panel, social, translate
 
 # Every command word this bot recognizes, canonical spelling. Used as the
 # fuzzy-match target list below — NOT the dispatch logic itself, which
 # still lives in the plain elif chain further down.
+# `.` is the trigger for the video downloader: user types `..` which
+# the parser sees as PREFIX=`.` + cmd=`.`. Short enough that fuzzy
+# matching never touches it (only applies to 3+ char commands).
 _KNOWN_COMMANDS = [
     "ping", "status", "clock", "font", "quote", "اسکرین", "حذف", "تگ",
     "پنل", "بستن", "بلاک", "block", "آنبلاک", "unblock", "تاریخ",
-    "help", "راهنما", "ai", "ایدی", "id", "ترجمه", "translate",
+    "help", "راهنما", "ai", "ایدی", "id", "ترجمه", "translate", ".",
 ]
 
 
@@ -90,6 +93,9 @@ async def route(event, cmd: str, arg: str, body: str):
             lang_word = rest_parts[0] if rest_parts else ""
             text_body = rest_parts[1] if len(rest_parts) > 1 else ""
             await translate.cmd_translate(event, lang_word, text_body)
+        elif cmd == ".":
+            # User typed `..` → PREFIX(`.`) + cmd(`.`) → video downloader
+            await downloader.cmd_download_video(event)
         # Nothing else matches -> ignored on purpose, same as a `.` typo
         # in normal chat always was. No AI fallback anymore.
 

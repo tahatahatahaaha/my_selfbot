@@ -17,6 +17,9 @@ imageio-ffmpeg==0.6.0
 # AI + networking
 httpx==0.28.1
 
+# Video downloader (..)
+yt-dlp>=2025.1.1
+
 # Translation
 deep-translator==1.11.4
 
