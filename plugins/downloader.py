@@ -1,11 +1,9 @@
 """
-Video downloader plugin — reply to any message containing a link and send `..`
+Video downloader — reply to any message containing a link and send `..`
 
 Supports: YouTube · Instagram · TikTok · Pinterest (and 1000+ other
-sites via yt-dlp under the hood).
-
-yt-dlp is imported lazily so it doesn't add to startup RAM unless this
-command is actually used.
+sites via yt-dlp). yt-dlp is imported lazily so it does not add to
+startup RAM unless this command is actually used.
 """
 
 import asyncio
@@ -16,16 +14,9 @@ import tempfile
 from logger import log
 from telegram_layer import client
 
-# Maximum file Telegram userbot can upload (capped below the hard 2 GB limit
-# to leave headroom and protect Railway's ephemeral disk).
-MAX_FILE_MB = 500
-
-# Any URL — yt-dlp supports far more platforms than the named ones.
-_URL_RE = re.compile(r'https?://[^\s\]\)>\"\']+', re.IGNORECASE)
-
-# Format string: prefer 720p MP4 so files stay reasonable; falls back
-# through progressively looser constraints until yt-dlp finds something.
-_FORMAT = (
+MAX_FILE_MB  = 500
+_URL_RE      = re.compile(r'https?://[^\s\]\)>\"\']+', re.IGNORECASE)
+_FORMAT      = (
     "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
     "/bestvideo[height<=720]+bestaudio"
     "/best[height<=720]"
@@ -35,23 +26,21 @@ _FORMAT = (
 
 def _extract_url(text: str) -> str | None:
     m = _URL_RE.search(text or "")
-    return m.group(0).rstrip(".,)") if m else None
+    return m.group(0).rstrip(".,)>") if m else None
 
 
 def _do_download(url: str, outdir: str) -> str:
-    """Blocking download — must be called via asyncio.to_thread()."""
-    import yt_dlp                           # lazy — only loads on first use
-
+    import yt_dlp
     opts = {
-        "format":                 _FORMAT,
-        "outtmpl":                os.path.join(outdir, "%(title).60s.%(ext)s"),
-        "merge_output_format":    "mp4",
-        "max_filesize":           MAX_FILE_MB * 1024 * 1024,
-        "quiet":                  True,
-        "no_warnings":            True,
-        "noplaylist":             True,      # single video only
-        "socket_timeout":         30,
-        "retries":                3,
+        "format":             _FORMAT,
+        "outtmpl":            os.path.join(outdir, "%(title).60s.%(ext)s"),
+        "merge_output_format":"mp4",
+        "max_filesize":       MAX_FILE_MB * 1024 * 1024,
+        "quiet":              True,
+        "no_warnings":        True,
+        "noplaylist":         True,
+        "socket_timeout":     30,
+        "retries":            3,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -60,26 +49,22 @@ def _do_download(url: str, outdir: str) -> str:
             )
         },
     }
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if info is None:
-            raise RuntimeError("yt-dlp بازگشتی نداشت")
+            raise RuntimeError("yt-dlp نتیجه‌ای برنگرداند")
         path = ydl.prepare_filename(info)
 
-    # yt-dlp sometimes writes .webm or changes extension after merging
     if not os.path.exists(path):
         base = os.path.splitext(path)[0]
         for ext in ("mp4", "webm", "mkv", "mov"):
-            candidate = f"{base}.{ext}"
-            if os.path.exists(candidate):
-                return candidate
-        # last resort: find whatever file appeared in the temp dir
+            c = f"{base}.{ext}"
+            if os.path.exists(c):
+                return c
         files = [os.path.join(outdir, f) for f in os.listdir(outdir)]
         if files:
             return max(files, key=os.path.getsize)
         raise FileNotFoundError("فایل دانلود‌شده پیدا نشد")
-
     return path
 
 
@@ -91,7 +76,7 @@ def _friendly_error(e: Exception) -> str:
         return "❌ این ویدیو در دسترس نیست یا حذف شده."
     if any(k in msg for k in ("filesize", "too large", "exceeds")):
         return f"❌ فایل بزرگ‌تر از {MAX_FILE_MB} MB است."
-    if any(k in msg for k in ("unsupported", "no video")):
+    if any(k in msg for k in ("unsupported", "no video", "no formats")):
         return "❌ این لینک پشتیبانی نمی‌شود یا ویدیویی ندارد."
     if any(k in msg for k in ("network", "timeout", "connect")):
         return "❌ خطای شبکه — چند ثانیه صبر کن و دوباره امتحان کن."
@@ -99,11 +84,10 @@ def _friendly_error(e: Exception) -> str:
 
 
 async def cmd_download_video(event):
-    """Triggered by `..` while replying to a message with a video link."""
     if not event.is_reply:
         await event.edit(
             "⬇️ **دانلود ویدیو**\n"
-            "روی پیامی که لینک ویدیو داره ریپلای کن و `..` بزن.\n"
+            "روی پیامی که لینک داره ریپلای کن و `..` بزن.\n"
             "یوتیوب · اینستاگرام · تیک‌تاک · پینترست پشتیبانی می‌شن."
         )
         return
@@ -136,7 +120,7 @@ async def cmd_download_video(event):
                 event.chat_id,
                 path,
                 supports_streaming=True,
-                reply_to=reply.id,          # reply to the original link message
+                reply_to=reply.id,
             )
             await event.delete()
         except Exception as e:
