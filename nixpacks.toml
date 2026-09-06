@@ -3,8 +3,5 @@
 # Do NOT use start.py or render_app.py on Railway — they spawn a
 # second subprocess which doubles RAM usage for no benefit.
 
-[phases.setup]
-nixPkgs = ["ffmpeg"]   # needed by yt-dlp to merge video+audio streams
-
 [start]
 cmd = "python main.py"
